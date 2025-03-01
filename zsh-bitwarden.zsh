@@ -1165,11 +1165,14 @@ bw_init_file() {
 }
 
 bw_edit_file() {
-  local modtime_before=$(stat -c %Y "$1")
+  local modtime_before modtime_after
+
+  modtime_before=$(date -r "$1" +"%s")
   $EDITOR "$1" || return $?
-  local modtime_after=$(stat -c %Y "$1")
+  modtime_after=$(date -r "$1" +"%s")
+
   if [[ "$modtime_before" -eq "$modtime_after" ]]; then
-    shred -u "$itemfile"
+    shred -u "$1"
     return 1
   fi
 }
