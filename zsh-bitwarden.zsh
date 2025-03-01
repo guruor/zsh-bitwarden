@@ -1210,7 +1210,50 @@ bw_json_edit() {
   # bw_reset_cache_list
 }
 
+create_temp_yaml_file() {
+  local content="$1"
+  local tempfile="$(mktemp)"
+  mv "${tempfile}" "${tempfile}.yml"
+  tempfile=""${tempfile}.yml""
+  chmod 600 "$tempfile"
+  echo "$content" > "$tempfile"
+  printf "%s" "$tempfile"
+}
+
+bw_notes_field_edit_as_yaml() {
+  bw_unlock || return $?
+  local -a simplifyarg narg
+  zparseopts -D -K -E -- {n,-new}=narg -simplify=simplifyarg || return
+
+  local item notes itemfile new_notes
+
+  if (( $#narg )); then
+    item=$(bw_template)
+  else
+    item=$(bw_tsv -p -r -O . -c .name "$@") || return $?
+  fi
+
+  notes=$(printf "%s" "$item" | jq -r '.notes // ""')
+
+  if echo "$notes" | yq -e . &>/dev/null; then
+    notes=$(echo "$notes" | yq eval '.' -)
+  fi
+
+  itemfile=$(create_temp_yaml_file "$notes") || return $?
+  bw_edit_file "$itemfile" || return $?
+  if [[ $? -ne 0 ]]; then
+    return 1
+  fi
+
+  new_notes=$(cat "$itemfile")
+  shred -u "$itemfile"
+
+  updated_item=$(printf "%s" "$item" | jq --arg notes "$new_notes" '.notes = $notes')
+  printf "%s" "$updated_item" | bw_edit_json || return $?
+}
+
 alias bwjs='bw_unlock && bw_tsv -p -r -O . -c .name "$@"'
+alias bwnfey='bw_notes_field_edit_as_yaml'
 alias bwjse='bw_json_edit'
 alias bwls='bw_list'
 alias bwtsv='bw_tsv'
