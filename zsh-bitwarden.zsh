@@ -1252,6 +1252,281 @@ bw_notes_field_edit_as_yaml() {
   printf "%s" "$updated_item" | bw_edit_json || return $?
 }
 
+# -------------------------------------------------------------------
+# Bitwarden ENV secrets
+# -------------------------------------------------------------------
+
+BWENV_PREFIX="${BWENV_PREFIX:-BWENV_}"
+BW_KEYCHAIN_BIN="${BW_KEYCHAIN_BIN:-$HOME/.local/bin/bw-keychain}"
+
+_bw_session() {
+    # Reuse an existing session if the caller intentionally has one.
+    if [[ -n "${BW_SESSION:-}" ]]; then
+        print -r -- "$BW_SESSION"
+        return
+    fi
+
+    # Otherwise unlock only for this operation.
+    # BW_SESSION is NOT globally exported.
+    bw unlock --raw
+}
+
+_bwenv_normalize_name() {
+    local name="$1"
+
+    if [[ "$name" == "${BWENV_PREFIX}"* ]]; then
+        print -r -- "${name#$BWENV_PREFIX}"
+    else
+        print -r -- "$name"
+    fi
+}
+
+_bwenv_item_name() {
+    local name="$1"
+
+    if [[ "$name" == "${BWENV_PREFIX}"* ]]; then
+        print -r -- "$name"
+    else
+        print -r -- "${BWENV_PREFIX}${name}"
+    fi
+}
+
+_bwenv_validate_name() {
+    [[ "$1" =~ '^[A-Za-z_][A-Za-z0-9_]*$' ]]
+}
+
+#
+# Produces:
+#
+#   NAME\0VALUE\0NAME\0VALUE\0...
+#
+# Filtering and prefix removal happen here so consumers don't need
+# Bitwarden-specific knowledge.
+#
+_bwenv_entries() {
+    local session="$1"
+    shift
+
+    local requested=("$@")
+
+    # No explicit arguments -> fall back to BW_ENV_SECRETS.
+    if (( ${#requested[@]} == 0 )); then
+        if [[ -z "${BW_ENV_SECRETS:-}" ]]; then
+            print -u2 "No secrets specified and BW_ENV_SECRETS is empty."
+            return 1
+        fi
+
+        requested=(${=BW_ENV_SECRETS})
+    fi
+
+    local requested_name item_name env_name item value
+    local found=0
+    local missing=0
+
+    for requested_name in "${requested[@]}"; do
+        item_name="$(_bwenv_item_name "$requested_name")"
+        env_name="$(_bwenv_normalize_name "$requested_name")"
+
+        item="$(
+            BW_SESSION="$session" bw get item "$item_name" 2>/dev/null
+        )"
+
+        if [[ $? -ne 0 || -z "$item" ]]; then
+            print -u2 "Bitwarden secret not found: $item_name"
+            (( missing++ ))
+            continue
+        fi
+
+        value="$(
+            jq -r '
+                if .login.password != null then
+                    .login.password
+                elif .notes != null then
+                    .notes
+                else
+                    empty
+                end
+            ' <<< "$item"
+        )"
+
+        if [[ -z "$value" ]]; then
+            print -u2 "Bitwarden item exists but has no usable secret: $item_name"
+            (( missing++ ))
+            continue
+        fi
+
+        print -rn -- "$env_name"
+        print -n '\0'
+        print -rn -- "$value"
+        print -n '\0'
+
+        (( found++ ))
+    done
+
+    (( found > 0 )) || return 1
+    (( missing == 0 ))
+}
+
+
+# -------------------------------------------------------------------
+# Bitwarden -> current shell
+#
+# bw_secrets_export
+# bw_secrets_export OPENAI_API_KEY GITHUB_TOKEN
+# bw_secrets_export BWENV_OPENAI_API_KEY
+# -------------------------------------------------------------------
+
+bw_secrets_export() {
+    local session
+    session="$(_bw_session)" || return 1
+
+    local name value
+    local count=0
+
+    while IFS= read -r -d '' name &&
+          IFS= read -r -d '' value; do
+
+        if ! _bwenv_validate_name "$name"; then
+            print -u2 "Invalid environment variable name: $name"
+            continue
+        fi
+
+        typeset -gx "$name=$value"
+
+        (( count++ ))
+        print "Exported: $name"
+
+    done < <(_bwenv_entries "$session" "$@")
+
+    if (( count == 0 )); then
+        print -u2 "No Bitwarden secrets were exported."
+        return 1
+    fi
+
+    print "Exported $count secret(s) from Bitwarden."
+}
+
+
+# -------------------------------------------------------------------
+# Bitwarden -> macOS Keychain
+#
+# bw_secrets_keychain_sync
+# bw_secrets_keychain_sync OPENAI_API_KEY GITHUB_TOKEN
+# -------------------------------------------------------------------
+
+bw_secrets_keychain_sync() {
+    if [[ "$OSTYPE" != darwin* ]]; then
+        print -u2 "Keychain integration is available only on macOS."
+        return 1
+    fi
+
+    if [[ ! -x "$BW_KEYCHAIN_BIN" ]]; then
+        print -u2 "Keychain helper not found: $BW_KEYCHAIN_BIN"
+        return 1
+    fi
+
+    local session
+    session="$(_bw_session)" || return 1
+
+    local name value
+    local count=0
+
+    while IFS= read -r -d '' name &&
+          IFS= read -r -d '' value; do
+
+        if ! _bwenv_validate_name "$name"; then
+            print -u2 "Skipping invalid environment variable: $name"
+            continue
+        fi
+
+        # Secret goes over stdin rather than as an argument to this helper.
+        print -rn -- "$value" | "$BW_KEYCHAIN_BIN" put "$name" || return 1
+
+        (( count++ ))
+        print "Cached in Keychain: $name"
+    done < <(_bwenv_entries "$session" "$@")
+
+    print "Cached $count secret(s) in Keychain."
+}
+
+
+# -------------------------------------------------------------------
+# Keychain -> current shell
+#
+# kc_secrets_export OPENAI_API_KEY GITHUB_TOKEN
+# -------------------------------------------------------------------
+
+kc_secrets_export() {
+    if [[ "$OSTYPE" != darwin* ]]; then
+        print -u2 "Keychain integration is available only on macOS."
+        return 1
+    fi
+
+    local name value
+
+    for name in "$@"; do
+        name="$(_bwenv_normalize_name "$name")"
+
+        if ! _bwenv_validate_name "$name"; then
+            print -u2 "Invalid environment variable: $name"
+            continue
+        fi
+
+        value="$("$BW_KEYCHAIN_BIN" get "$name")" || {
+            print -u2 "Not found in Keychain: $name"
+            continue
+        }
+
+        typeset -gx "$name=$value"
+        print "Exported: $name"
+    done
+}
+
+
+# -------------------------------------------------------------------
+# Remove variables from current shell
+#
+# kc_secrets_unset OPENAI_API_KEY GITHUB_TOKEN
+# -------------------------------------------------------------------
+
+kc_secrets_unset() {
+    local name
+
+    for name in "$@"; do
+        name="$(_bwenv_normalize_name "$name")"
+        unset "$name"
+        print "Unset: $name"
+    done
+}
+
+
+# -------------------------------------------------------------------
+# Keychain -> user launchd environment
+#
+# Useful ONLY when something outside the shell needs to inherit it.
+#
+# kc_secrets_global_export OPENAI_API_KEY
+# kc_secrets_global_unset OPENAI_API_KEY
+# -------------------------------------------------------------------
+
+kc_secrets_global_export() {
+    local name
+
+    for name in "$@"; do
+        name="$(_bwenv_normalize_name "$name")"
+        "$BW_KEYCHAIN_BIN" global-set "$name" || return 1
+    done
+}
+
+kc_secrets_global_unset() {
+    local name
+
+    for name in "$@"; do
+        name="$(_bwenv_normalize_name "$name")"
+        "$BW_KEYCHAIN_BIN" global-unset "$name"
+    done
+}
+
 alias bwjs='bw_unlock && bw_tsv -p -r -O . -c .name "$@"'
 alias bwnfey='bw_notes_field_edit_as_yaml'
 alias bwjse='bw_json_edit'
@@ -1277,3 +1552,9 @@ alias bwg='bw_generate -ulns --length 21'
 alias bwgs='bw_generate -uln --length 21'
 alias bwlc='bw_create_login'
 alias bwnc='bw_create_note'
+alias bwexp='bw_secrets_export'
+alias bwsync='bw_secrets_keychain_sync'
+alias kcexp='kc_secrets_export'
+alias kcunset='kc_secrets_unset'
+alias kcglobal='kc_secrets_global_export'
+alias kcunglobal='kc_secrets_global_unset'
