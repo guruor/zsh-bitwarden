@@ -1,0 +1,49 @@
+#compdef bwitem
+
+local -a commands nested
+commands=(
+  'password:select and copy a login password'
+  'username:select and copy a login username'
+  'credentials:copy username then password'
+  'field:select a custom field value'
+  'json:select and print item JSON'
+  'search:advanced TSV/jq/fzf search'
+  'generate:generate a password'
+  'create:create an item'
+  'edit:edit an item value'
+  'add:add an item value'
+  'help:show bwitem help'
+)
+
+if (( CURRENT == 2 )); then
+  _describe 'bwitem command' commands
+  return
+fi
+
+case "${words[2]}" in
+  create)
+    nested=('login:create a login item')
+    _describe 'item type' nested
+    ;;
+  edit)
+    nested=(
+      'json:edit complete item JSON'
+      'name:edit item name'
+      'username:edit login username'
+      'password:edit login password'
+      'field:edit, rename, or delete a custom field'
+    )
+    _describe 'editable value' nested
+    ;;
+  add)
+    nested=('field:add a custom field')
+    _describe 'value type' nested
+    ;;
+  generate)
+    nested=(
+      'secure:letters, numbers, and special characters'
+      'alphanumeric:letters and numbers only'
+    )
+    _describe 'password type' nested
+    ;;
+esac

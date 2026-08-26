@@ -1,29 +1,54 @@
-
 # Requirements
 
-The following should be installed and on your PATH
+Install `zsh`, the Bitwarden CLI (`bw`), `jq`, `fzf`, and `curl`. The plugin also uses `column`, `pgrep`, and `mktemp`, which are normally supplied by the operating system.
 
-1. [bw](https://github.com/bitwarden/cli) for accessing vault
+Clipboard commands require one of `pbcopy`, `wl-copy`, `xclip`, `xsel`, `clip.exe`, or the Oh My Zsh `clipcopy` function. Run `bwdoctor` after installation to check these dependencies without unlocking the vault.
 
-2. [jq](https://github.com/stedolan/jq) to manipulate the JSON used by `bw`
+## Plugin managers
 
-3. [fzf](https://github.com/junegunn/fzf) for selecting from multiple items
+Any Zsh plugin manager can load `zsh-bitwarden.plugin.zsh`. The loader resolves repository-relative files and adds `completions/` to `fpath`.
 
-# Installation
+```zsh
+# Zinit
+zinit light guruor/zsh-bitwarden
+
+# Antigen
+antigen bundle guruor/zsh-bitwarden
+
+# zplug
+zplug "guruor/zsh-bitwarden"
+```
+
+For Antidote, add `guruor/zsh-bitwarden` to `~/.zsh_plugins.txt`.
 
 ## Oh My Zsh
 
-1. Clone this repository into `$ZSH_CUSTOM/plugins` (by default `~/.oh-my-zsh/custom/plugins`)
+```sh
+git clone https://github.com/guruor/zsh-bitwarden \
+  "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-bitwarden"
+```
 
-    ```sh
-    git clone https://github.com/Game4Move78/zsh-bitwarden ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-bitwarden
-    ```
+Add `zsh-bitwarden` to the plugins in `~/.zshrc`:
 
-2. Add the plugin to the list of plugins for Oh My Zsh to load (inside `~/.zshrc`):
+```zsh
+plugins=(... zsh-bitwarden)
+```
 
-    ```sh
-    plugins=( 
-        # other plugins...
-        zsh-bitwarden
-    )
-    ```
+## Optional integrations
+
+`bwnote yaml` requires `yq`.
+
+`bwenv store`, `bwenv load`, and `bwenv remove` require Python [`keyring`](https://pypi.org/project/keyring/) in the same Python installation used by `bin/bwenv-keyring`:
+
+```sh
+python3 -m pip install --user keyring
+```
+
+Python keyring uses macOS Keychain, Windows Credential Manager, or an available Linux Secret Service/KWallet backend. Linux may also require distribution packages for Python keyring and a running desktop keyring service.
+
+Reload Zsh and verify the installation:
+
+```zsh
+bwdoctor
+bwenv doctor
+```

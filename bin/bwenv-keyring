@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Minimal cross-platform keyring adapter for bwenv."""
+
+import argparse
+import os
+import re
+import sys
+
+
+NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def fail(message: str) -> int:
+    print(message, file=sys.stderr)
+    return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Store bwenv values in the OS keyring")
+    parser.add_argument("command", choices=("put", "get", "delete", "status"))
+    parser.add_argument("name", nargs="?")
+    args = parser.parse_args()
+
+    try:
+        import keyring
+        from keyring.errors import KeyringError, PasswordDeleteError
+    except ImportError:
+        return fail("Python package 'keyring' is not installed.")
+
+    service = os.environ.get("BWENV_KEYRING_SERVICE", "zsh-bitwarden")
+    if args.command == "status":
+        try:
+            backend = keyring.get_keyring()
+            print(f"keyring backend: {backend.__class__.__module__}.{backend.__class__.__name__}")
+            return 0 if getattr(backend, "priority", 0) > 0 else fail("No usable keyring backend found.")
+        except Exception:
+            return fail("Unable to initialize the OS keyring backend.")
+
+    if args.name is None or not NAME_PATTERN.fullmatch(args.name):
+        return fail("A valid environment variable name is required.")
+
+    try:
+        if args.command == "put":
+            value = sys.stdin.read()
+            if not value:
+                return fail("Refusing to store an empty secret.")
+            keyring.set_password(service, args.name, value)
+        elif args.command == "get":
+            value = keyring.get_password(service, args.name)
+            if value is None:
+                return fail("Secret not found in the OS keyring.")
+            sys.stdout.write(value)
+        elif args.command == "delete":
+            keyring.delete_password(service, args.name)
+    except PasswordDeleteError:
+        return fail("Secret not found in the OS keyring.")
+    except KeyringError:
+        return fail("The OS keyring operation failed.")
+    except Exception:
+        return fail("Unexpected OS keyring failure.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

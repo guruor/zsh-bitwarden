@@ -1,0 +1,5 @@
+#!/usr/bin/env zsh
+
+while IFS= read -r _; do
+  :
+done

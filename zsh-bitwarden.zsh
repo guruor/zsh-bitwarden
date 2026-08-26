@@ -1,5 +1,5 @@
 # zsh-bitwarden -- A Bitwarden CLI wrapper for Zsh
-# https://github.com/Game4Move78/zsh-bitwarden
+# https://github.com/guruor/zsh-bitwarden
 
 # Copyright (c) 2021 Patrick Lenihan
 
@@ -297,7 +297,7 @@ bw_search() {
 
   if [ $? -ne 0 ] || [ -z "$items" ] \
        || [ "$noitems" -eq "0" ]; then
-    echo "No results found. Try '' to search all items." >&2
+    echo "No results found in the current vault data. Run 'bwvault sync' and retry if the item changed recently." >&2
     return 4
   fi
 
@@ -593,7 +593,22 @@ bw_list() {
 }
 
 bw_copy() {
-  clipcopy
+  if (( $+functions[clipcopy] )); then
+    clipcopy
+  elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy
+  elif command -v wl-copy >/dev/null 2>&1; then
+    wl-copy
+  elif command -v xclip >/dev/null 2>&1; then
+    xclip -selection clipboard
+  elif command -v xsel >/dev/null 2>&1; then
+    xsel --clipboard --input
+  elif command -v clip.exe >/dev/null 2>&1; then
+    clip.exe
+  else
+    print -u2 'No clipboard provider found. Install wl-clipboard/xclip on Linux or use a command output option.'
+    return 1
+  fi
 }
 
 bw_tsv() {
@@ -704,9 +719,9 @@ bw_user_pass() {
     return 2
   fi
   echo -n "Hit enter to copy username..."
-  read _ && printf "%s" "$user" | clipcopy
+  read _ && printf "%s" "$user" | bw_copy
   echo -n "Hit enter to copy password..."
-  read _ && printf "%s" "$pass" | clipcopy
+  read _ && printf "%s" "$pass" | bw_copy
 }
 
 bw_select_values() {
@@ -1164,15 +1179,31 @@ bw_init_file() {
   printf "%s" "$itemfile"
 }
 
+_bw_remove_temp() {
+  [[ -n "$1" && -e "$1" ]] || return 0
+  if command -v shred >/dev/null 2>&1; then
+    shred -u -- "$1"
+  elif [[ "$OSTYPE" == darwin* ]]; then
+    rm -Pf -- "$1" 2>/dev/null || rm -f -- "$1"
+  else
+    rm -f -- "$1"
+  fi
+}
+
 bw_edit_file() {
-  local modtime_before modtime_after
+  local modtime_before modtime_after editor_status
 
   modtime_before=$(date -r "$1" +"%s")
-  $EDITOR "$1" || return $?
+  $EDITOR "$1"
+  editor_status=$?
+  if (( editor_status != 0 )); then
+    _bw_remove_temp "$1"
+    return $editor_status
+  fi
   modtime_after=$(date -r "$1" +"%s")
 
   if [[ "$modtime_before" -eq "$modtime_after" ]]; then
-    shred -u "$1"
+    _bw_remove_temp "$1"
     return 1
   fi
 }
@@ -1197,12 +1228,12 @@ bw_json_edit() {
   fi
   item=$(printf "%s" "$item" | jq -M)
   itemfile=$(printf "%s" "$item" | bw_init_file) || return $?
-  bw_edit_file "$itemfile" || return $?
-  if [[ $? -ne 0 ]]; then
+  if ! bw_edit_file "$itemfile"; then
+    _bw_remove_temp "$itemfile"
     return 1
   fi
-  item=$(cat "$itemfile")
-  shred -u "$itemfile"
+  item=$(<"$itemfile")
+  _bw_remove_temp "$itemfile"
   if (( $#simplifyarg )); then
     item=$(printf "%s" "$item" | bw_unsimplify) || return $?
   fi
@@ -1216,7 +1247,7 @@ create_temp_yaml_file() {
   mv "${tempfile}" "${tempfile}.yml"
   tempfile=""${tempfile}.yml""
   chmod 600 "$tempfile"
-  echo "$content" > "$tempfile"
+  print -r -- "$content" > "$tempfile"
   printf "%s" "$tempfile"
 }
 
@@ -1240,13 +1271,13 @@ bw_notes_field_edit_as_yaml() {
   fi
 
   itemfile=$(create_temp_yaml_file "$notes") || return $?
-  bw_edit_file "$itemfile" || return $?
-  if [[ $? -ne 0 ]]; then
+  if ! bw_edit_file "$itemfile"; then
+    _bw_remove_temp "$itemfile"
     return 1
   fi
 
-  new_notes=$(cat "$itemfile")
-  shred -u "$itemfile"
+  new_notes=$(<"$itemfile")
+  _bw_remove_temp "$itemfile"
 
   updated_item=$(printf "%s" "$item" | jq --arg notes "$new_notes" '.notes = $notes')
   printf "%s" "$updated_item" | bw_edit_json || return $?
@@ -1257,7 +1288,23 @@ bw_notes_field_edit_as_yaml() {
 # -------------------------------------------------------------------
 
 BWENV_PREFIX="${BWENV_PREFIX:-BWENV_}"
-BW_KEYCHAIN_BIN="${BW_KEYCHAIN_BIN:-$HOME/.local/bin/bw-keychain}"
+BWENV_KEYRING_BIN="${BWENV_KEYRING_BIN:-${0:h}/bin/bwenv-keyring}"
+BWENV_KEYRING_SERVICE="${BWENV_KEYRING_SERVICE:-zsh-bitwarden}"
+
+_bwenv_require() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        print -u2 "bwenv requires '$1'."
+        return 1
+    fi
+}
+
+_bwenv_require_keyring() {
+    if [[ ! -x "$BWENV_KEYRING_BIN" ]]; then
+        print -u2 "bwenv keyring helper is not executable: $BWENV_KEYRING_BIN"
+        print -u2 "Run 'bwenv doctor' for setup guidance."
+        return 1
+    fi
+}
 
 _bw_session() {
     # Reuse an existing session if the caller intentionally has one.
@@ -1295,266 +1342,564 @@ _bwenv_validate_name() {
     [[ "$1" =~ '^[A-Za-z_][A-Za-z0-9_]*$' ]]
 }
 
-#
-# Produces:
-#
-#   NAME\0VALUE\0NAME\0VALUE\0...
-#
-# Filtering and prefix removal happen here so consumers don't need
-# Bitwarden-specific knowledge.
-#
-_bwenv_entries() {
+_bwenv_select_names() {
+    local session="$1" candidates selected line
+
+    _bwenv_require fzf || return 1
+    candidates="$(
+        setopt localoptions pipefail
+        BW_SESSION="$session" bw list items 2>/dev/null \
+            | jq -r --arg prefix "$BWENV_PREFIX" '
+                .[]
+                | select(.name | startswith($prefix))
+                | [
+                    (.name[($prefix | length):]),
+                    .name,
+                    (if ((.login.password? // "") | length) > 0 then "login password"
+                     elif ((.notes? // "") | length) > 0 then "secure note"
+                     else "no usable value" end)
+                  ]
+                | @tsv
+            '
+    )" || {
+        print -u2 "Unable to list Bitwarden items from the current vault data."
+        print -u2 "Run 'bw sync' and retry."
+        return 1
+    }
+
+    if [[ -z "$candidates" ]]; then
+        print -u2 "No Bitwarden items use the '$BWENV_PREFIX' prefix in the current vault data."
+        print -u2 "Run 'bw sync' and retry if items were added recently."
+        return 1
+    fi
+
+    selected="$(
+        print -r -- "$candidates" \
+            | fzf --multi --delimiter=$'\t' --with-nth=1,2,3 \
+                  --header='Select environment variables (values are never displayed)'
+    )"
+    if [[ $? -ne 0 || -z "$selected" ]]; then
+        return 130
+    fi
+
+    reply=()
+    for line in ${(f)selected}; do
+        reply+=("${line%%$'\t'*}")
+    done
+}
+
+_bwenv_source_names() {
     local session="$1"
     shift
 
-    local requested=("$@")
-
-    # No explicit arguments -> fall back to BW_ENV_SECRETS.
-    if (( ${#requested[@]} == 0 )); then
-        if [[ -z "${BW_ENV_SECRETS:-}" ]]; then
-            print -u2 "No secrets specified and BW_ENV_SECRETS is empty."
-            return 1
-        fi
-
-        requested=(${=BW_ENV_SECRETS})
+    if (( $# > 0 )); then
+        reply=("$@")
+    elif [[ -n "${BW_ENV_SECRETS:-}" ]]; then
+        reply=(${=BW_ENV_SECRETS})
+    else
+        _bwenv_select_names "$session" || return $?
     fi
+}
 
-    local requested_name item_name env_name item value
-    local found=0
-    local missing=0
+_bwenv_local_names() {
+    if (( $# > 0 )); then
+        reply=("$@")
+    elif [[ -n "${BW_ENV_SECRETS:-}" ]]; then
+        reply=(${=BW_ENV_SECRETS})
+    else
+        print -u2 "Specify environment variable names or set BW_ENV_SECRETS."
+        return 1
+    fi
+}
 
-    for requested_name in "${requested[@]}"; do
-        item_name="$(_bwenv_item_name "$requested_name")"
+_bwenv_get_value() {
+    local session="$1" requested_name="$2" item_name item
+    item_name="$(_bwenv_item_name "$requested_name")"
+
+    item="$(BW_SESSION="$session" bw get item "$item_name" 2>/dev/null)" || {
+        print -u2 "Unable to find a unique Bitwarden item named '$item_name' in the current vault data."
+        print -u2 "Run 'bw sync' and retry; if it is still missing, verify the item name and BWENV_PREFIX."
+        return 1
+    }
+
+    REPLY="$(
+        jq -er '
+            if ((.login.password? // "") | length) > 0 then .login.password
+            elif ((.notes? // "") | length) > 0 then .notes
+            else error("no usable value") end
+        ' <<< "$item"
+    )" || {
+        print -u2 "Bitwarden item '$item_name' has no non-empty login password or note."
+        return 1
+    }
+}
+
+_bwenv_export() {
+    _bwenv_require bw || return 1
+    _bwenv_require jq || return 1
+
+    local session requested_name env_name
+    local count=0 failed=0
+    local -a names
+    session="$(_bw_session)" || return 1
+    _bwenv_source_names "$session" "$@" || return $?
+    names=("${reply[@]}")
+
+    for requested_name in "${names[@]}"; do
         env_name="$(_bwenv_normalize_name "$requested_name")"
-
-        item="$(
-            BW_SESSION="$session" bw get item "$item_name" 2>/dev/null
-        )"
-
-        if [[ $? -ne 0 || -z "$item" ]]; then
-            print -u2 "Bitwarden secret not found: $item_name"
-            (( missing++ ))
+        if ! _bwenv_validate_name "$env_name"; then
+            print -u2 "Invalid environment variable name: $env_name"
+            (( ++failed ))
             continue
         fi
-
-        value="$(
-            jq -r '
-                if .login.password != null then
-                    .login.password
-                elif .notes != null then
-                    .notes
-                else
-                    empty
-                end
-            ' <<< "$item"
-        )"
-
-        if [[ -z "$value" ]]; then
-            print -u2 "Bitwarden item exists but has no usable secret: $item_name"
-            (( missing++ ))
+        if ! _bwenv_get_value "$session" "$requested_name"; then
+            (( ++failed ))
             continue
         fi
-
-        print -rn -- "$env_name"
-        print -n '\0'
-        print -rn -- "$value"
-        print -n '\0'
-
-        (( found++ ))
+        typeset -gx "$env_name=$REPLY"
+        (( ++count ))
+        print "Exported: $env_name"
     done
 
-    (( found > 0 )) || return 1
-    (( missing == 0 ))
+    (( count > 0 )) || return 1
+    print "Exported $count secret(s) from Bitwarden into this shell."
+    (( failed == 0 ))
 }
 
+_bwenv_store() {
+    _bwenv_require bw || return 1
+    _bwenv_require jq || return 1
+    _bwenv_require_keyring || return 1
 
-# -------------------------------------------------------------------
-# Bitwarden -> current shell
-#
-# bw_secrets_export
-# bw_secrets_export OPENAI_API_KEY GITHUB_TOKEN
-# bw_secrets_export BWENV_OPENAI_API_KEY
-# -------------------------------------------------------------------
-
-bw_secrets_export() {
-    local session
+    local session requested_name env_name
+    local count=0 failed=0
+    local -a names
     session="$(_bw_session)" || return 1
+    _bwenv_source_names "$session" "$@" || return $?
+    names=("${reply[@]}")
 
-    local name value
-    local count=0
-
-    while IFS= read -r -d '' name &&
-          IFS= read -r -d '' value; do
-
-        if ! _bwenv_validate_name "$name"; then
-            print -u2 "Invalid environment variable name: $name"
+    for requested_name in "${names[@]}"; do
+        env_name="$(_bwenv_normalize_name "$requested_name")"
+        if ! _bwenv_validate_name "$env_name"; then
+            print -u2 "Invalid environment variable name: $env_name"
+            (( ++failed ))
             continue
         fi
+        if ! _bwenv_get_value "$session" "$requested_name"; then
+            (( ++failed ))
+            continue
+        fi
+        if ! print -rn -- "$REPLY" | BWENV_KEYRING_SERVICE="$BWENV_KEYRING_SERVICE" "$BWENV_KEYRING_BIN" put "$env_name"; then
+            print -u2 "Unable to store '$env_name' in the configured keyring."
+            (( ++failed ))
+            continue
+        fi
+        (( ++count ))
+        print "Stored in keyring: $env_name"
+    done
 
-        typeset -gx "$name=$value"
-
-        (( count++ ))
-        print "Exported: $name"
-
-    done < <(_bwenv_entries "$session" "$@")
-
-    if (( count == 0 )); then
-        print -u2 "No Bitwarden secrets were exported."
-        return 1
-    fi
-
-    print "Exported $count secret(s) from Bitwarden."
+    (( count > 0 )) || return 1
+    print "Stored $count secret(s). Use 'bwenv load' to avoid unlocking Bitwarden again."
+    (( failed == 0 ))
 }
 
+_bwenv_load() {
+    _bwenv_require_keyring || return 1
 
-# -------------------------------------------------------------------
-# Bitwarden -> macOS Keychain
-#
-# bw_secrets_keychain_sync
-# bw_secrets_keychain_sync OPENAI_API_KEY GITHUB_TOKEN
-# -------------------------------------------------------------------
+    local requested_name env_name value
+    local count=0 failed=0
+    local -a names
+    _bwenv_local_names "$@" || return 1
+    names=("${reply[@]}")
 
-bw_secrets_keychain_sync() {
-    if [[ "$OSTYPE" != darwin* ]]; then
-        print -u2 "Keychain integration is available only on macOS."
-        return 1
-    fi
-
-    if [[ ! -x "$BW_KEYCHAIN_BIN" ]]; then
-        print -u2 "Keychain helper not found: $BW_KEYCHAIN_BIN"
-        return 1
-    fi
-
-    local session
-    session="$(_bw_session)" || return 1
-
-    local name value
-    local count=0
-
-    while IFS= read -r -d '' name &&
-          IFS= read -r -d '' value; do
-
-        if ! _bwenv_validate_name "$name"; then
-            print -u2 "Skipping invalid environment variable: $name"
+    for requested_name in "${names[@]}"; do
+        env_name="$(_bwenv_normalize_name "$requested_name")"
+        if ! _bwenv_validate_name "$env_name"; then
+            print -u2 "Invalid environment variable name: $env_name"
+            (( ++failed ))
             continue
         fi
-
-        # Secret goes over stdin rather than as an argument to this helper.
-        print -rn -- "$value" | "$BW_KEYCHAIN_BIN" put "$name" || return 1
-
-        (( count++ ))
-        print "Cached in Keychain: $name"
-    done < <(_bwenv_entries "$session" "$@")
-
-    print "Cached $count secret(s) in Keychain."
-}
-
-
-# -------------------------------------------------------------------
-# Keychain -> current shell
-#
-# kc_secrets_export OPENAI_API_KEY GITHUB_TOKEN
-# -------------------------------------------------------------------
-
-kc_secrets_export() {
-    if [[ "$OSTYPE" != darwin* ]]; then
-        print -u2 "Keychain integration is available only on macOS."
-        return 1
-    fi
-
-    local name value
-
-    for name in "$@"; do
-        name="$(_bwenv_normalize_name "$name")"
-
-        if ! _bwenv_validate_name "$name"; then
-            print -u2 "Invalid environment variable: $name"
-            continue
-        fi
-
-        value="$("$BW_KEYCHAIN_BIN" get "$name")" || {
-            print -u2 "Not found in Keychain: $name"
+        value="$(BWENV_KEYRING_SERVICE="$BWENV_KEYRING_SERVICE" "$BWENV_KEYRING_BIN" get "$env_name" 2>/dev/null)" || {
+            print -u2 "Not found in the configured keyring: $env_name"
+            print -u2 "Run 'bwenv store $env_name' to retrieve it from Bitwarden."
+            (( ++failed ))
             continue
         }
+        typeset -gx "$env_name=$value"
+        (( ++count ))
+        print "Loaded: $env_name"
+    done
 
-        typeset -gx "$name=$value"
-        print "Exported: $name"
+    (( count > 0 )) || return 1
+    print "Loaded $count secret(s) from the keyring into this shell."
+    (( failed == 0 ))
+}
+
+_bwenv_remove() {
+    _bwenv_require_keyring || return 1
+
+    local requested_name env_name
+    local count=0 failed=0
+    local -a names
+    _bwenv_local_names "$@" || return 1
+    names=("${reply[@]}")
+
+    for requested_name in "${names[@]}"; do
+        env_name="$(_bwenv_normalize_name "$requested_name")"
+        if ! _bwenv_validate_name "$env_name"; then
+            print -u2 "Invalid environment variable name: $env_name"
+            (( ++failed ))
+            continue
+        fi
+        if ! BWENV_KEYRING_SERVICE="$BWENV_KEYRING_SERVICE" "$BWENV_KEYRING_BIN" delete "$env_name" 2>/dev/null; then
+            print -u2 "Not found in the configured keyring: $env_name"
+            (( ++failed ))
+            continue
+        fi
+        (( ++count ))
+        print "Removed from keyring: $env_name"
+    done
+
+    (( count > 0 )) || return 1
+    (( failed == 0 ))
+}
+
+_bwenv_unset() {
+    local requested_name env_name
+    local -a names
+    _bwenv_local_names "$@" || return 1
+    names=("${reply[@]}")
+
+    for requested_name in "${names[@]}"; do
+        env_name="$(_bwenv_normalize_name "$requested_name")"
+        if ! _bwenv_validate_name "$env_name"; then
+            print -u2 "Invalid environment variable name: $env_name"
+            continue
+        fi
+        unset "$env_name"
+        print "Unset: $env_name"
     done
 }
 
-
-# -------------------------------------------------------------------
-# Remove variables from current shell
-#
-# kc_secrets_unset OPENAI_API_KEY GITHUB_TOKEN
-# -------------------------------------------------------------------
-
-kc_secrets_unset() {
-    local name
-
-    for name in "$@"; do
-        name="$(_bwenv_normalize_name "$name")"
-        unset "$name"
-        print "Unset: $name"
+_bwenv_doctor() {
+    local failed=0 command_name
+    for command_name in bw jq fzf python3; do
+        if command -v "$command_name" >/dev/null 2>&1; then
+            print "ok: $command_name"
+        else
+            print "missing: $command_name"
+            (( ++failed ))
+        fi
     done
+
+    if [[ -x "$BWENV_KEYRING_BIN" ]]; then
+        if BWENV_KEYRING_SERVICE="$BWENV_KEYRING_SERVICE" "$BWENV_KEYRING_BIN" status; then
+            print "ok: keyring helper $BWENV_KEYRING_BIN"
+        else
+            print -u2 "unavailable: Python keyring backend"
+            print -u2 "Install it with: python3 -m pip install --user keyring"
+            (( ++failed ))
+        fi
+    else
+        print -u2 "missing or not executable: $BWENV_KEYRING_BIN"
+        (( ++failed ))
+    fi
+    (( failed == 0 ))
 }
 
+_bwenv_help() {
+    case "${1:-}" in
+        export)
+            print -r -- 'Usage: bwenv export [NAME ...]
+Export Bitwarden items named BWENV_<NAME> into the current shell.
+With no names, BW_ENV_SECRETS is used; otherwise fzf provides safe multi-selection.
+This command never syncs automatically. Run `bw sync` when vault data may be stale.'
+            ;;
+        store)
+            print -r -- 'Usage: bwenv store [NAME ...]
+Retrieve secrets from Bitwarden once and store them in the OS keyring.
+Secret values are passed to the keyring helper over stdin and are never shown in fzf.'
+            ;;
+        load)
+            print -r -- 'Usage: bwenv load [NAME ...]
+Load secrets from the OS keyring into the current shell without contacting Bitwarden.
+With no names, BW_ENV_SECRETS must be configured.'
+            ;;
+        remove)
+            print -r -- 'Usage: bwenv remove [NAME ...]
+Delete secrets from the OS keyring. Bitwarden items are not changed.'
+            ;;
+        unset)
+            print -r -- 'Usage: bwenv unset [NAME ...]
+Remove variables from the current shell. The keyring and Bitwarden are not changed.'
+            ;;
+        doctor)
+            print -r -- 'Usage: bwenv doctor
+Check required commands and the configured Python keyring backend without reading secrets.'
+            ;;
+        *)
+            print -r -- 'Usage: bwenv <command> [arguments]
 
-# -------------------------------------------------------------------
-# Keychain -> user launchd environment
-#
-# Useful ONLY when something outside the shell needs to inherit it.
-#
-# kc_secrets_global_export OPENAI_API_KEY
-# kc_secrets_global_unset OPENAI_API_KEY
-# -------------------------------------------------------------------
+Commands:
+  export   Bitwarden -> current shell
+  store    Bitwarden -> OS keyring
+  load     OS keyring -> current shell
+  remove   delete values from the OS keyring
+  unset    remove values from the current shell
+  status   show configuration and keyring availability
+  doctor   check dependencies without reading secrets
+  help     show this help or help for a command
 
-kc_secrets_global_export() {
-    local name
-
-    for name in "$@"; do
-        name="$(_bwenv_normalize_name "$name")"
-        "$BW_KEYCHAIN_BIN" global-set "$name" || return 1
-    done
+Reads never sync automatically. Run `bw sync` explicitly when vault data may be stale.'
+            ;;
+    esac
 }
 
-kc_secrets_global_unset() {
-    local name
+bwenv() {
+    local command_name="${1:-help}"
+    (( $# > 0 )) && shift
 
-    for name in "$@"; do
-        name="$(_bwenv_normalize_name "$name")"
-        "$BW_KEYCHAIN_BIN" global-unset "$name"
-    done
+    case "$command_name" in
+        export) _bwenv_export "$@" ;;
+        store) _bwenv_store "$@" ;;
+        load) _bwenv_load "$@" ;;
+        remove) _bwenv_remove "$@" ;;
+        unset) _bwenv_unset "$@" ;;
+        status)
+            print "prefix: $BWENV_PREFIX"
+            print "configured names: ${BW_ENV_SECRETS:-<none>}"
+            print "keyring service: $BWENV_KEYRING_SERVICE"
+            print "keyring helper: $BWENV_KEYRING_BIN"
+            [[ -x "$BWENV_KEYRING_BIN" ]] && BWENV_KEYRING_SERVICE="$BWENV_KEYRING_SERVICE" "$BWENV_KEYRING_BIN" status
+            return 0
+            ;;
+        doctor) _bwenv_doctor ;;
+        help|-h|--help) _bwenv_help "${1:-}" ;;
+        *)
+            print -u2 "Unknown bwenv command: $command_name"
+            print -u2 "Run 'bwenv help' to see available commands."
+            return 2
+            ;;
+    esac
 }
 
-alias bwjs='bw_unlock && bw_tsv -p -r -O . -c .name "$@"'
-alias bwnfey='bw_notes_field_edit_as_yaml'
-alias bwjse='bw_json_edit'
-alias bwls='bw_list'
-alias bwtsv='bw_tsv'
-alias bwst='bw_status'
-alias bwsn='bw_sync'
-alias bwul='bw_unlock'
-alias bwlk='bw_lock'
-alias bwn='bw_tsv -o .name'
-alias bwus='bw_tsv -l -c .name -o .login.username'
-alias bwpw='bw_tsv -l -c .name -c .login.username -O .login.password'
-alias bwno='bw_tsv -n -c .name -o .notes'
-alias bwfl='bw_field'
-alias bwup='bw_user_pass'
-alias bwne='bw_edit_name'
-alias bwuse='bw_edit_username'
-alias bwpwe='bw_edit_password'
-alias bwnoe='bw_edit_note'
-alias bwfle='bw_edit_field'
-alias bwfla='bw_add_field'
-alias bwg='bw_generate -ulns --length 21'
-alias bwgs='bw_generate -uln --length 21'
-alias bwlc='bw_create_login'
-alias bwnc='bw_create_note'
-alias bwexp='bw_secrets_export'
-alias bwsync='bw_secrets_keychain_sync'
-alias kcexp='kc_secrets_export'
-alias kcunset='kc_secrets_unset'
-alias kcglobal='kc_secrets_global_export'
-alias kcunglobal='kc_secrets_global_unset'
+_bw_group_help() {
+  case "$1" in
+    vault)
+      print -r -- 'Usage: bwvault <command>
+
+Commands:
+  unlock   unlock the vault and start bw serve when needed
+  lock     lock the vault
+  status   show vault lock status
+  sync     explicitly synchronize the vault
+  help     show this help'
+      ;;
+    item)
+      print -r -- 'Usage: bwitem <command> [arguments]
+
+Commands:
+  password       select and copy a login password
+  username       select and copy a login username
+  credentials    interactively copy username, then password
+  field          select a custom field value
+  json           select and print an item as JSON
+  search         advanced TSV/jq/fzf search
+  generate       generate a secure password
+  create login   create a login item
+  edit TYPE      edit json, name, username, password, or field
+  add field      add a custom field
+  help           show this help'
+      ;;
+    note)
+      print -r -- 'Usage: bwnote <command> [arguments]
+
+Commands:
+  get      select a secure note value
+  create   create a secure note
+  edit     edit a secure note value
+  yaml     edit a note as structured YAML using $EDITOR
+  help     show this help'
+      ;;
+  esac
+}
+
+_bw_mutation_notice() {
+  print -u2 "Change sent to Bitwarden. If a later lookup is stale, run 'bwvault sync'."
+}
+
+bwvault() {
+  local command_name="${1:-help}"
+  (( $# > 0 )) && shift
+
+  case "$command_name" in
+    unlock) bw_unlock "$@" ;;
+    lock) bw_lock "$@" ;;
+    status) bw_serve && bw_status "$@" ;;
+    sync) bw_serve && bw_sync "$@" ;;
+    help|-h|--help) _bw_group_help vault ;;
+    *)
+      print -u2 "Unknown bwvault command: $command_name"
+      print -u2 "Run 'bwvault help' to see available commands."
+      return 2
+      ;;
+  esac
+}
+
+_bwitem_edit() {
+  local edit_type="${1:-}"
+  (( $# > 0 )) && shift
+
+  case "$edit_type" in
+    json) bw_json_edit "$@" && _bw_mutation_notice ;;
+    name) bw_edit_name "$@" && _bw_mutation_notice ;;
+    username) bw_edit_username "$@" && _bw_mutation_notice ;;
+    password) bw_edit_password "$@" && _bw_mutation_notice ;;
+    field) bw_edit_field "$@" && _bw_mutation_notice ;;
+    *)
+      print -u2 'Usage: bwitem edit <json|name|username|password|field> [arguments]'
+      return 2
+      ;;
+  esac
+}
+
+_bwitem_generate() {
+  local generate_type=secure
+  if (( $# > 0 )); then
+    if [[ "$1" == -* ]]; then
+      generate_type=custom
+    else
+      generate_type="$1"
+      shift
+    fi
+  fi
+
+  case "$generate_type" in
+    secure) bw_generate -ulns --length 21 "$@" ;;
+    alphanumeric) bw_generate -uln --length 21 "$@" ;;
+    custom) bw_generate "$@" ;;
+    *)
+      print -u2 'Usage: bwitem generate [secure|alphanumeric] [options]'
+      return 2
+      ;;
+  esac
+}
+
+bwitem() {
+  local command_name="${1:-help}" nested=""
+  (( $# > 0 )) && shift
+
+  case "$command_name" in
+    password) bw_tsv -l -c .name -c .login.username -O .login.password "$@" ;;
+    username) bw_tsv -l -c .name -o .login.username "$@" ;;
+    credentials) bw_user_pass "$@" ;;
+    field) bw_field "$@" ;;
+    json) bw_unlock && bw_tsv -p -r -O . -c .name "$@" ;;
+    search) bw_tsv "$@" ;;
+    generate) _bwitem_generate "$@" ;;
+    create)
+      nested="${1:-}"
+      (( $# > 0 )) && shift
+      if [[ "$nested" == login ]]; then
+        bw_create_login "$@" && _bw_mutation_notice
+      else
+        print -u2 'Usage: bwitem create login [arguments]'
+        return 2
+      fi
+      ;;
+    edit) _bwitem_edit "$@" ;;
+    add)
+      nested="${1:-}"
+      (( $# > 0 )) && shift
+      if [[ "$nested" == field ]]; then
+        bw_add_field "$@" && _bw_mutation_notice
+      else
+        print -u2 'Usage: bwitem add field [arguments]'
+        return 2
+      fi
+      ;;
+    help|-h|--help) _bw_group_help item ;;
+    *)
+      print -u2 "Unknown bwitem command: $command_name"
+      print -u2 "Run 'bwitem help' to see available commands."
+      return 2
+      ;;
+  esac
+}
+
+bwnote() {
+  local command_name="${1:-help}"
+  (( $# > 0 )) && shift
+
+  case "$command_name" in
+    get) bw_tsv -n -c .name -o .notes "$@" ;;
+    create) bw_create_note "$@" && _bw_mutation_notice ;;
+    edit) bw_edit_note "$@" && _bw_mutation_notice ;;
+    yaml) bw_notes_field_edit_as_yaml "$@" && _bw_mutation_notice ;;
+    help|-h|--help) _bw_group_help note ;;
+    *)
+      print -u2 "Unknown bwnote command: $command_name"
+      print -u2 "Run 'bwnote help' to see available commands."
+      return 2
+      ;;
+  esac
+}
+
+_bwdoctor_version() {
+  local command_name="$1" output
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    print -u2 "missing: $command_name"
+    return 1
+  fi
+  if ! output="$(command "$command_name" --version 2>/dev/null)"; then
+    print -u2 "not working: $command_name --version"
+    return 1
+  fi
+  print "ok: $command_name${output:+ (${output%%$'\n'*})}"
+}
+
+_bwdoctor_clipboard() {
+  local provider
+  for provider in pbcopy wl-copy xclip xsel clip.exe; do
+    if command -v "$provider" >/dev/null 2>&1; then
+      print "ok: clipboard ($provider)"
+      return 0
+    fi
+  done
+  if (( $+functions[clipcopy] )); then
+    print 'ok: clipboard (clipcopy)'
+    return 0
+  fi
+  print -u2 'missing: clipboard provider (pbcopy, wl-copy, xclip, xsel, or clip.exe)'
+  return 1
+}
+
+bwdoctor() {
+  local failed=0 command_name
+  for command_name in bw jq fzf curl; do
+    _bwdoctor_version "$command_name" || (( ++failed ))
+  done
+  for command_name in column pgrep mktemp; do
+    if command -v "$command_name" >/dev/null 2>&1; then
+      print "ok: $command_name"
+    else
+      print -u2 "missing: $command_name"
+      (( ++failed ))
+    fi
+  done
+  _bwdoctor_clipboard || (( ++failed ))
+
+  command -v yq >/dev/null 2>&1 && print 'optional: yq available' || print 'optional: yq missing (required only for bwnote yaml)'
+  if [[ -x "$BWENV_KEYRING_BIN" ]] && BWENV_KEYRING_SERVICE="$BWENV_KEYRING_SERVICE" "$BWENV_KEYRING_BIN" status >/dev/null 2>&1; then
+    print 'optional: Python keyring backend available'
+  else
+    print 'optional: Python keyring backend unavailable (required only for bwenv store/load/remove)'
+  fi
+
+  (( failed == 0 ))
+}
+
+# Remove aliases created by earlier plugin versions when reloading in-place.
+unalias bwjs bwnfey bwjse bwls bwtsv bwst bwsn bwul bwlk bwn bwus bwpw bwno \
+        bwfl bwup bwne bwuse bwpwe bwnoe bwfle bwfla bwg bwgs bwlc bwnc \
+        bwexp bwsync kcexp kcunset kcglobal kcunglobal 2>/dev/null || true

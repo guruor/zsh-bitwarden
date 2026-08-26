@@ -1,119 +1,116 @@
 # zsh-bitwarden
-This plugin provides functions to manage a [bitwarden](https://github.com/bitwarden/cli) session
 
+Interactive Zsh workflows on top of the official [Bitwarden CLI](https://github.com/bitwarden/clients/tree/main/apps/cli). The plugin keeps `bw` available for complete CLI access and adds `fzf` selection, structured-note editing, environment-secret loading, and shell completion.
 
-## Installation
+## Install
 
-See [INSTALL.md](INSTALL.md).
-
-## Usage
-
-| Command    | Description                 |
-|------------|-----------------------------|
-| `bwul`     | unlock the vault            |
-| `bwlk`     | lock the vault              |
-| `bwst`     | vault status                |
-| `bwsn`     | sync the vault              |
-| `bwjs`     | print item json             |
-| `bwjse`    | edit item json in $EDITOR   |
-| `bwtsv -t` | print tsv table             |
-| `bwtsv`    | select tsv data             |
-| `bwtsv -t` | print tsv table             |
-| `bwg`      | alphanum + special password |
-| `bwgs`     | alphanum password           |
-| `bwus`     | get username                |
-| `bwuse`    | edit username               |
-| `bwpw`     | get password                |
-| `bwpwe`    | edit password               |
-| `bwfl`     | get field                   |
-| `bwfle`    | edit field                  |
-| `bwfle -r` | rename field                |
-| `bwfle -d` | delete field                |
-| `bwfla`    | add field                   |
-| `bwno`     | get note                    |
-| `bwnoe`    | edit note                   |
-| `bwne`     | edit item name              |
-| `bwup`     | copy username then password |
-| `bwlc`     | create login                |
-| `bwnc`     | create note                 |
-
-## Examples
+The plugin works with managers that source `zsh-bitwarden.plugin.zsh`.
 
 ```zsh
-# copy password to clipboard and include .notes column in finder
-bwpw .notes
-# create entry called `mylogin` with username `user123@example.com` and copy secure password to clipboard
-bwlc -n mylogin -u user123@example.com
-# rename to mynewlogin
-echo -n mynewlogin | bwne -s mylogin
-# get username and password
-bwup -s mynewlogin
-# add field
-echo -n myvalue | bwfla -s mynewlogin -f myfield
-# copy field
-bwfl -s mynewlogin -f myfield
-# rename field to `newvalue`
-echo -n newvalue | bwfle -s mynewlogin -f myfield -r
+# Zinit
+zinit light guruor/zsh-bitwarden
+
+# Antidote: add to ~/.zsh_plugins.txt, then reload Antidote
+guruor/zsh-bitwarden
 ```
 
-### Search
+For Oh My Zsh and manual installation, see [INSTALL.md](INSTALL.md). After loading the plugin, verify required and optional integrations:
 
 ```zsh
-bwtsv --simplify -s gmail -lc -c .name -c .username -o '.[] | .fields | length'
+bwdoctor
 ```
 
-This command searches for "gmail" (`-s gmail`) and returns matching logins (`-l`). The use of `-c` along with argument `.name` causes the name of each item to be displayed in `fzf`. The use of `-o` along with `'.[] | .fields | length'` causes the number of fields to be displayed in `fzf` and also printed to output when selected. 
+Required commands are `bw`, `jq`, `fzf`, `curl`, and `column`. Clipboard operations use `pbcopy`, `wl-copy`, `xclip`, `xsel`, `clip.exe`, or Oh My Zsh's `clipcopy`.
 
-| Character | Visible in fzf | Printed to output |
-|-----------|----------------|-------------------|
-| c         | yes            | no                |
-| o         | yes            | yes               |
-| O         | no             | yes               |
+## Commands
+
+Type a group followed by Tab to explore its commands, or run its `help` command.
 
 ```zsh
-local fieldname="email"
-local fieldpath=".fields[\"$fieldname\"][0]"
-bwtsv --simplify -ls wikipedia -c .name -c .username -h "$fieldname" -o "$fieldpath"
+bwvault help
+bwitem help
+bwnote help
+bwenv help
 ```
-By using the JQ path `$fieldpath` that selects the field named "email", this example lets you copy one of the emails associated with the search string `wikipedia`. Any item not containing this field will not be displayed.
+
+### Vault
 
 ```zsh
-local fieldname="email"
-local fieldpath=".fields[\"$fieldname\"] | select(length > 0) | join(\", \")"
-bwtsv --simplify -pls wikipedia -c .name -c .username -h "$fieldname" -o "$fieldpath" | bw_tsv -h "$fieldname" -o '.'
+bwvault unlock
+bwvault status
+bwvault sync
+bwvault lock
 ```
 
-Equivalent code but using piped bw_tsv to select from duplicates.
+Reads never synchronize automatically. If a lookup cannot find a recently changed item, run `bwvault sync` and retry.
 
-### TSV Table
+### Items
 
 ```zsh
-bwtsv --simplify -tls wikipedia .name .username -h 'num fields' '.fields | keys | length'
+bwitem password -s github
+bwitem username -s github
+bwitem credentials -s github
+bwitem field -s github -f token
+bwitem json -s github
+
+bwitem create login -n mylogin -u user@example.com
+bwitem edit password -s mylogin
+bwitem edit field -s mylogin -f token
+bwitem add field -s mylogin -f token
+
+bwitem generate
+bwitem generate alphanumeric
 ```
 
-When using `-t`, instead of fzf selection, `bwtsv` displays all results in a TSV table.
+Selections use `fzf`. Password and field commands copy to the first available clipboard provider instead of printing values to the terminal.
 
-### JQ search
+After a successful create or edit, the plugin confirms that the change was sent to Bitwarden and recommends `bwvault sync` only if a later lookup appears stale.
 
-```
-bwtsv --simplify -o .password ---search-pass dog --search-user frog
-```
+For advanced jq/TSV selection, use `bwitem search` with the existing search options:
 
-This command finds items with both a username containing "frog" AND password containing "dog" and copies the password to clipboard.
-
-```
-bwtsv --simplify -o .password -j '(.password | test("dog")) or (.username | test("frog"))'
+```zsh
+bwitem search --simplify -s gmail -c .name -c .username -o .password
 ```
 
-This command finds items with either a username containing "frog" OR password containing "dog" and copies the password to clipboard.
+### Notes
 
-`--search-name`, `{--search-user, -u}`, `--search-pass`, `--search-note` apply a filter to search items using case insensitive regex. `{-j,--search-jq}` allows a custom filter.
+```zsh
+bwnote get -s infrastructure
+bwnote create -n infrastructure
+bwnote edit -s infrastructure
+bwnote yaml -s infrastructure
+```
 
-`--simplify` restructuring the items for concise queries.
-- `.login.username` becomes `.username` 
-- `[.fields[] | select(.name == "email") | .value] | first` becomes `.fields.email[0]`
+`bwnote yaml` requires `yq` and edits a permission-restricted temporary file with `$EDITOR`.
 
-### Default header names
+### Environment secrets
 
-If you don't like the default header names displayed in fzf, then either edit `default-headers.csv` or export `BW_DEFAULT_HEADERS` to your file.
+Create Bitwarden items with the `BWENV_` prefix, such as `BWENV_OPENAI_API_KEY`. `bwenv` uses the login password when present, otherwise the item note.
 
+```zsh
+# Bitwarden -> current shell
+bwenv export OPENAI_API_KEY
+
+# Bitwarden -> OS keyring, then keyring -> current shell without unlocking again
+bwenv store OPENAI_API_KEY
+bwenv load OPENAI_API_KEY
+
+bwenv unset OPENAI_API_KEY
+bwenv remove OPENAI_API_KEY
+```
+
+Set `BW_ENV_SECRETS="OPENAI_API_KEY GITHUB_TOKEN"` for default names. Without arguments or defaults, `export` and `store` use safe `fzf --multi` selection; only item names and source types reach `fzf`, never decrypted values.
+
+Keyring storage is intentionally limited to explicit environment values. Caching complete Bitwarden items would duplicate structured decrypted vault data and create stale copies. `bwenv store/load/remove` use Python [`keyring`](https://pypi.org/project/keyring/) for macOS Keychain, Linux Secret Service/KWallet, or Windows Credential Manager; see [INSTALL.md](INSTALL.md).
+
+## Security
+
+- No command synchronizes automatically.
+- Secrets sent to the keyring helper travel over stdin, not command arguments.
+- Completion never queries or unlocks the vault.
+- Keyring loading does not contact Bitwarden or expose values in command output.
+- Repository tests use fake `bw`, `fzf`, and keyring executables and never access a real vault.
+
+## Acknowledgements
+
+Originally based on [Game4Move78/zsh-bitwarden](https://github.com/Game4Move78/zsh-bitwarden) by Patrick Lenihan.

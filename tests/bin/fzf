@@ -1,0 +1,14 @@
+#!/usr/bin/env zsh
+
+if [[ "$1" == --version ]]; then
+    print -r -- 'test-fzf 1.0'
+    return 0
+fi
+
+local first_line line
+while IFS= read -r line; do
+    print -r -- "$line" >> "$BWENV_TEST_FZF_LOG"
+    [[ -n "$first_line" ]] || first_line="$line"
+done
+[[ -n "$first_line" ]] || return 1
+print -r -- "$first_line"

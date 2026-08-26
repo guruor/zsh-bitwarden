@@ -1,0 +1,20 @@
+#compdef bwenv
+
+local -a commands names
+commands=(
+  'export:Bitwarden to the current shell'
+  'store:Bitwarden to the OS keyring'
+  'load:OS keyring to the current shell'
+  'remove:delete values from the OS keyring'
+  'unset:remove values from the current shell'
+  'status:show safe configuration details'
+  'doctor:check keyring dependencies'
+  'help:show command-specific help'
+)
+
+if (( CURRENT == 2 )); then
+  _describe 'bwenv command' commands
+elif [[ -n "${BW_ENV_SECRETS:-}" ]]; then
+  names=(${=BW_ENV_SECRETS})
+  _describe 'configured environment variable' names
+fi

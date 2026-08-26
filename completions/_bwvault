@@ -1,0 +1,12 @@
+#compdef bwvault
+
+local -a commands
+commands=(
+  'unlock:unlock the vault and start bw serve'
+  'lock:lock the vault'
+  'status:show vault lock status'
+  'sync:explicitly synchronize the vault'
+  'help:show bwvault help'
+)
+
+_describe 'bwvault command' commands

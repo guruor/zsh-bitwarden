@@ -1,0 +1,38 @@
+#!/usr/bin/env zsh
+
+[[ -n "${BWENV_TEST_LOG:-}" ]] && print -r -- "$*" >> "$BWENV_TEST_LOG"
+
+if [[ "$1" == --version ]]; then
+    print -r -- 'test-bw 1.0'
+    return 0
+fi
+
+case "$1 $2" in
+    'unlock --raw')
+        print -r -- 'test-session'
+        ;;
+    'list items')
+        print -r -- '[
+          {"name":"BWENV_OPENAI_API_KEY","login":{"password":"test-openai-value"},"notes":null},
+          {"name":"BWENV_STRUCTURED_SECRET","login":null,"notes":"first: one\nsecond: two"},
+          {"name":"ordinary-login","login":{"password":"not-an-env-secret"},"notes":null}
+        ]'
+        ;;
+    'get item')
+        case "$3" in
+            BWENV_OPENAI_API_KEY)
+                print -r -- '{"name":"BWENV_OPENAI_API_KEY","login":{"password":"test-openai-value"},"notes":null}'
+                ;;
+            BWENV_STRUCTURED_SECRET)
+                print -r -- '{"name":"BWENV_STRUCTURED_SECRET","login":null,"notes":"first: one\nsecond: two"}'
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+        ;;
+    *)
+        print -u2 "Unexpected fake bw invocation: $*"
+        return 2
+        ;;
+esac

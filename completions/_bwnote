@@ -1,0 +1,12 @@
+#compdef bwnote
+
+local -a commands
+commands=(
+  'get:select a secure note value'
+  'create:create a secure note'
+  'edit:edit a secure note value'
+  'yaml:edit a note as structured YAML'
+  'help:show bwnote help'
+)
+
+_describe 'bwnote command' commands

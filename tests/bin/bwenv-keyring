@@ -1,0 +1,26 @@
+#!/usr/bin/env zsh
+
+local command_name="$1" name="$2" value_file="$BWENV_TEST_KEYRING/$2"
+
+case "$command_name" in
+    put)
+        [[ -n "$name" ]] || return 2
+        IFS= read -r -d '' value || true
+        [[ -n "$value" ]] || return 1
+        print -rn -- "$value" > "$value_file"
+        ;;
+    get)
+        [[ -f "$value_file" ]] || return 1
+        print -rn -- "$(<"$value_file")"
+        ;;
+    delete)
+        [[ -f "$value_file" ]] || return 1
+        rm -- "$value_file"
+        ;;
+    status)
+        print -r -- 'keyring backend: test'
+        ;;
+    *)
+        return 2
+        ;;
+esac
