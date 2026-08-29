@@ -71,8 +71,18 @@ assert_contains "$(<"$error")" 'Unsafe mode'
 if bwfile save "$empty" --name NEWLINE_DESCRIPTION --description $'line one\nline two' > "$output" 2> "$error"; then fail 'control-character description succeeded'; fi
 assert_contains "$(<"$error")" 'unsupported metadata characters'
 if bwfile save "$HOME/.config" > "$output" 2> "$error"; then fail 'directory save succeeded'; fi
-ln -s "$aws" "$TEST_TMP/source-link"
-if bwfile save "$TEST_TMP/source-link" > "$output" 2> "$error"; then fail 'symlink source save succeeded'; fi
+source_link="$HOME/.config/app/credentials-link"
+ln -s "$aws" "$source_link"
+bwfile save "$source_link" --name SYMLINK_SOURCE > "$output" 2> "$error"
+assert_contains "$(<"$output")" 'Path: ~/.config/app/credentials-link'
+jq -e '
+  [.[] | select(.name == "BWFILE_SYMLINK_SOURCE")][0]
+  | (.notes | contains("path: ~/.config/app/credentials-link"))
+    and ([.fields[] | select(.name == "content" and .value == "replacement without newline")] | length == 1)
+' "$BWFILE_TEST_STATE" >/dev/null || fail 'symlink source path or target content was not preserved'
+bwfile remove SYMLINK_SOURCE --force > "$output" 2> "$error"
+[[ -L "$source_link" ]] || fail 'removing symlink-source item changed the local symlink'
+rm "$source_link"
 odd_source="$HOME/.config/app/secret file; \$(touch never-source).yaml"
 print -r -- 'opaque: value' > "$odd_source"
 chmod 640 "$odd_source"

@@ -111,7 +111,7 @@ Keyring storage is intentionally limited to explicit environment values. Caching
 
 ```yaml
 version: 1
-path: ~/.aws/credentials
+path: ~/.config/aws/credentials
 mode: "0600"
 lifecycle: provision
 description: AWS credentials for external workloads
@@ -120,7 +120,7 @@ description: AWS credentials for external workloads
 Normal commands use the logical name without `BWFILE_`:
 
 ```zsh
-bwfile save ~/.aws/credentials \
+bwfile save ~/.config/aws/credentials \
   --name AWS_CREDENTIALS \
   --lifecycle provision \
   --description "AWS credentials"
@@ -133,7 +133,7 @@ bwfile load AWS_CREDENTIALS
 
 Names are normalized to uppercase underscore form. `save` infers a name from the basename when `--name` is omitted, captures the current mode unless `--mode` is supplied, and never deletes the source. An existing item is not changed unless `--force` (or its `--update` alias) is supplied; updates preserve the item ID.
 
-`provision` files normally belong on a configured machine, such as `~/.aws/credentials`, `~/.config/sops/age/keys.txt`, or an application secret config. `recovery` files contain exceptional or disaster-recovery material. Bulk provisioning is explicit and idempotent:
+`provision` files normally belong on a configured machine, such as `~/.config/aws/credentials`, `~/.config/sops/age/keys.txt`, or an application secret config. `recovery` files contain exceptional or disaster-recovery material. When the path passed to `save` is a symlink, metadata retains that symlink path while the payload and mode are read from its resolved regular-file target. Broken links and links to non-regular files are rejected. Bulk provisioning is explicit and idempotent:
 
 ```zsh
 # --all intentionally means all provision items, never recovery items.
@@ -144,7 +144,7 @@ bwfile load --lifecycle provision
 bwfile load --lifecycle recovery
 ```
 
-Loads create missing parent directories with a restrictive umask, stream content into a mode-`0600` temporary file in the destination directory, apply the configured mode, and atomically rename it. Existing identical files are not rewritten; mode drift is corrected. Different content, directories, symlink destinations, and paths with existing symlink components are refused unless the only issue is differing content and `--force` is given. Paths must be absolute or start with `~/`; `$VAR`, command substitutions, backticks, globs, and other shell syntax are never expanded or executed.
+Loads create missing parent directories with a restrictive umask, stream content into a mode-`0600` temporary file in the destination directory, apply the configured mode, and atomically rename it. Existing identical files are not rewritten; mode drift is corrected. Different content, directories, symlink destinations, and paths with existing symlink components are refused unless the only issue is differing content and `--force` is given. Saving through a symlink does not weaken this restore-time protection: remove or deliberately replace the symlink before loading that item. Paths must be absolute or start with `~/`; `$VAR`, command substitutions, backticks, globs, and other shell syntax are never expanded or executed.
 
 Version 1 is textual only. It accepts empty and multiline text while preserving trailing-newline semantics, but rejects NUL bytes or content that cannot round-trip through `jq` without changing bytes. Binary files are not automatically base64-encoded. Modes must be four-digit octal strings and may grant only owner read/write plus optional group read; examples include `0600`, `0400`, and `0640`. Owner/group execute, group write, and every other-user permission are rejected because these persistent files contain high-sensitivity material. `bwfile` requires Mike Farah `yq` v4 to parse metadata safely.
 

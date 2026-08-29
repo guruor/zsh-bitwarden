@@ -1722,7 +1722,13 @@ _bwfile_valid_mode() {
 }
 
 _bwfile_file_mode() {
-  local mode
+  local mode numeric_mode
+  local -a stat_details
+  if zmodload zsh/stat 2>/dev/null && zstat -L -A stat_details +mode -- "$1" 2>/dev/null; then
+    numeric_mode="${stat_details[1]}"
+    printf '0%03o' "$(( numeric_mode & 8#0777 ))"
+    return 0
+  fi
   mode="$(stat -c '%a' -- "$1" 2>/dev/null)" || \
     mode="$(stat -f '%Lp' -- "$1" 2>/dev/null)" || return 1
   [[ "$mode" =~ '^[0-7]{3,4}$' ]] || return 1
@@ -1855,7 +1861,7 @@ _bwfile_content_matches() {
 
 _bwfile_save() {
   _bwfile_require_tools || return 1
-  local source="" logical_name="" lifecycle=provision mode="" description="" force=0
+  local source="" payload_source="" logical_name="" lifecycle=provision mode="" description="" force=0
   while (( $# > 0 )); do
     case "$1" in
       -n|--name) (( $# >= 2 )) || { print -u2 "Missing value for $1."; return 2; }; logical_name="$2"; shift 2 ;;
@@ -1869,11 +1875,12 @@ _bwfile_save() {
     esac
   done
   [[ -n "$source" ]] || { print -u2 'Usage: bwfile save PATH [--name NAME] [--lifecycle provision|recovery] [--mode MODE] [--description TEXT] [--force]'; return 2; }
-  [[ ! -L "$source" ]] || { print -u2 "Refusing symlink source: $source"; return 1; }
   [[ -f "$source" && -r "$source" ]] || { print -u2 "Source is not a readable regular file: $source"; return 1; }
-  _bwfile_text_file "$source" || { print -u2 'bwfile v1 accepts only textual files without NUL bytes or invalid text encoding.'; return 1; }
+  payload_source="${source:A}"
+  [[ -f "$payload_source" && -r "$payload_source" ]] || { print -u2 "Symlink target is not a readable regular file: $source"; return 1; }
+  _bwfile_text_file "$payload_source" || { print -u2 'bwfile v1 accepts only textual files without NUL bytes or invalid text encoding.'; return 1; }
   [[ "$lifecycle" == provision || "$lifecycle" == recovery ]] || { print -u2 "Invalid lifecycle: $lifecycle"; return 2; }
-  [[ -n "$mode" ]] || mode="$(_bwfile_file_mode "$source")" || { print -u2 'Unable to determine source permissions.'; return 1; }
+  [[ -n "$mode" ]] || mode="$(_bwfile_file_mode "$payload_source")" || { print -u2 "Unable to determine source permissions: $payload_source"; return 1; }
   [[ "$mode" == 0* ]] || mode="0$mode"
   _bwfile_valid_mode "$mode" || { print -u2 "Unsafe mode '$mode': only owner read/write and optional group read are allowed."; return 1; }
 
@@ -1902,7 +1909,7 @@ _bwfile_save() {
   if (( count == 1 )); then
     id="$(print -rn -- "$matches" | jq -r '.[0].id')"
     if ! BW_SESSION="$session" bw get item "$id" 2>/dev/null \
-      | jq -c --arg name "$item_name" --arg notes "$metadata" --rawfile content "$source" '
+      | jq -c --arg name "$item_name" --arg notes "$metadata" --rawfile content "$payload_source" '
           .name = $name | .type = 2 | .secureNote = {type: 0} | .notes = $notes
           | .fields = ([.fields[]? | select(.name != "content")] + [{name:"content", value:$content, type:1}])
           | del(.login, .card, .identity, .sshKey)
@@ -1912,7 +1919,7 @@ _bwfile_save() {
     fi
   else
     if ! BW_SESSION="$session" bw get template item 2>/dev/null \
-      | jq -c --arg name "$item_name" --arg notes "$metadata" --rawfile content "$source" '
+      | jq -c --arg name "$item_name" --arg notes "$metadata" --rawfile content "$payload_source" '
           .name = $name | .type = 2 | .secureNote = {type: 0} | .notes = $notes
           | .fields = [{name:"content", value:$content, type:1}]
           | del(.login, .card, .identity, .sshKey)
@@ -2164,7 +2171,7 @@ Commands:
   help                    show this help
 
 Reads never sync automatically. Recovery items are never included by --all.
-Paths must be absolute or begin with ~/; symlink destinations are refused.
+Paths must be absolute or begin with ~/. Save follows source symlinks; load refuses symlinks.
 Version 1 supports textual files only and owner read/write with optional group read.'
 }
 
