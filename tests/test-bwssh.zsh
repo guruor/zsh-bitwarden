@@ -111,6 +111,19 @@ assert_contains "$(<"$output")" 'Imported: import key; $(touch never-import)  SH
 [[ ! -e never-import ]] || fail 'shell-sensitive import name was evaluated'
 [[ "$(<"$BWSSH_TEST_LOG")$(<"$BWSSH_TEST_SSH_KEYGEN_LOG")$(<"$output")$(<"$error")" != *TEST_PRIVATE_IMPORT* ]] || fail 'import disclosed private key material'
 
+if ! bwssh import "$private_path" --name existing-public --public-key "$public_path" > "$output" 2> "$error"; then
+    fail "import with an existing matching public key failed: $(<"$error")"
+fi
+assert_contains "$(<"$output")" 'Public key already exists and matches:'
+
+print -r -- 'ssh-ed25519 AAAADIFFERENT other@test' > "$public_path"
+if bwssh import "$private_path" --name mismatched-public --public-key "$public_path" > "$output" 2> "$error"; then
+    fail 'import overwrote a mismatched public key without --force'
+fi
+assert_contains "$(<"$error")" 'does not match the private key'
+bwssh import "$private_path" --name replaced-public --public-key "$public_path" --force > "$output" 2> "$error"
+[[ "$(<"$public_path")" == 'ssh-ed25519 AAAATESTIMPORT import@test' ]] || fail 'forced public key output was not replaced'
+
 export BWSSH_DUPLICATE_IMPORT=true
 if bwssh import "$private_path" --name duplicate > "$output" 2> "$error"; then
     fail 'duplicate fingerprint import succeeded without --force'
@@ -123,7 +136,16 @@ export BWSSH_FAIL_COMMAND=create
 if bwssh import "$private_path" --name create-failure > "$output" 2> "$error"; then
     fail 'import succeeded when bw create failed'
 fi
+assert_contains "$(<"$error")" 'Bitwarden test create failure.'
 unset BWSSH_FAIL_COMMAND
+
+export BWSSH_FAIL_COMMAND=create BWSSH_CREATE_PRIVATE_ERROR=1
+if bwssh import "$private_path" --name redacted-failure > "$output" 2> "$error"; then
+    fail 'import succeeded when bw create returned a private error'
+fi
+assert_contains "$(<"$error")" 'details were redacted'
+[[ "$(<"$error")" != *TEST_PRIVATE_IMPORT* ]] || fail 'create error disclosed private key material'
+unset BWSSH_FAIL_COMMAND BWSSH_CREATE_PRIVATE_ERROR
 
 invalid="$TEST_TMP/invalid key"
 print -r -- 'INVALID' > "$invalid"

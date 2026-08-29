@@ -110,8 +110,11 @@ Keyring storage is intentionally limited to explicit environment values. Caching
 
 ```zsh
 # Import an existing key once. The source file is not deleted.
-bwssh import ~/.ssh/id_ed25519 --name github-personal \
-  --public-key ~/.ssh/public-keys/github-personal.pub
+bwssh import ~/.ssh/id_ed25519 --name github-personal
+
+# Optional: also write the derived public key to a new dotfiles path.
+bwssh import ~/.ssh/work_ed25519 --name github-work \
+  --public-key ~/.ssh/public-keys/github-work.pub
 
 # After login/reboot, agent restart, or TTL expiry:
 bwssh load
@@ -128,6 +131,18 @@ bwssh unload --all
 ```
 
 With no names, `bwssh load` and `bwssh unload` use safe `fzf --multi` selection. Only item IDs, names, fingerprints, and public-key types reach `fzf`. Set `BW_SSH_TTL=10h` for a default native agent lifetime, or use `bwssh load github-personal --ttl 10h`. With no TTL, `ssh-add` uses its native default behavior.
+
+`bwssh import` takes one input: the private-key path. It runs `ssh-keygen -y` to derive the public key and fingerprint needed by the native Bitwarden SSH-key item. An existing `.pub` file is not required and is not read unless you name it with `--public-key`. That option means "write the derived public key here," not "use this public key as input."
+
+If the `--public-key` path already contains the matching public key, import leaves it unchanged and continues. If it contains a different key, import refuses to overwrite it unless `--force` is supplied. You can therefore import an existing `id_rsa`/`id_rsa.pub` pair with either of these commands:
+
+```zsh
+# The existing id_rsa.pub is not needed during import.
+bwssh import ~/.ssh/id_rsa --name id_rsa
+
+# Also verify that the existing public file matches the private key.
+bwssh import ~/.ssh/id_rsa --name id_rsa --public-key ~/.ssh/id_rsa.pub
+```
 
 Bitwarden is the durable encrypted source of truth. The native agent is temporary runtime storage, so loading must be repeated after its identities disappear. Private-key data necessarily passes through the memory of `bw`, `jq`, the plugin pipeline, and `ssh-add`, but it is not intentionally persisted by `bwssh`.
 
@@ -152,7 +167,7 @@ Host production
 #### Existing-key migration
 
 1. Keep the existing private key in place during migration, for example `~/.ssh/id_rsa`.
-2. Import it with `bwssh import ~/.ssh/id_rsa --name github-personal --public-key ~/.ssh/public-keys/github-personal.pub`.
+2. Import it with `bwssh import ~/.ssh/id_rsa --name github-personal`. Add `--public-key ~/.ssh/public-keys/github-personal.pub` only when the derived public key should also be written to that path.
 3. Load it with `bwssh load github-personal --ttl 10h`.
 4. Verify with `ssh-add -l` and the relevant connection, such as `ssh -T git@github.com`.
 5. Change `IdentityFile` to the exported public key and set `IdentitiesOnly yes`.

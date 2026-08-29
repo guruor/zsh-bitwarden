@@ -12,7 +12,7 @@ if [[ "$1" == --version ]]; then
 fi
 
 if [[ -n "${BWSSH_TEST_MODE:-}" ]]; then
-    [[ "${BWSSH_FAIL_COMMAND:-}" == "$1" ]] && return 1
+    [[ "${BWSSH_FAIL_COMMAND:-}" == "$1" && "$1" != create ]] && return 1
     github_private='TEST_PRIVATE_GITHUB'
     work_private='TEST_PRIVATE_WORK'
     github_public='ssh-ed25519 AAAATESTGITHUB github@test'
@@ -33,14 +33,14 @@ if [[ -n "${BWSSH_TEST_MODE:-}" ]]; then
                 --argjson duplicate "${BWSSH_DUPLICATE_IMPORT:-false}" '
                 [
                   {id:"ssh-github", type:5, name:"github-personal",
-                   sshKey:{privateKey:$gp, publicKey:$gpub, fingerprint:"SHA256:GITHUB"}},
+                   sshKey:{privateKey:$gp, publicKey:$gpub, keyFingerprint:"SHA256:GITHUB"}},
                   {id:"ssh-work", type:5, name:"work key; $(touch never)",
-                   sshKey:{privateKey:$wp, publicKey:$wpub, fingerprint:"SHA256:WORK"}},
+                   sshKey:{privateKey:$wp, publicKey:$wpub, keyFingerprint:"SHA256:WORK"}},
                   {id:"login", type:1, name:"ordinary", login:{password:"NOT_AN_SSH_KEY"}}
                 ]
                 + (if $duplicate then [{id:"ssh-import", type:5, name:"existing-import",
                     sshKey:{privateKey:"HIDDEN", publicKey:"ssh-ed25519 AAAATESTIMPORT import@test",
-                            fingerprint:"SHA256:IMPORT"}}] else [] end)
+                            keyFingerprint:"SHA256:IMPORT"}}] else [] end)
               '
             ;;
         'get item')
@@ -48,11 +48,11 @@ if [[ -n "${BWSSH_TEST_MODE:-}" ]]; then
             case "$3" in
                 ssh-github)
                     jq -cn --arg p "$github_private" --arg pub "$github_public" \
-                        '{id:"ssh-github",type:5,name:"github-personal",sshKey:{privateKey:$p,publicKey:$pub,fingerprint:"SHA256:GITHUB"}}'
+                        '{id:"ssh-github",type:5,name:"github-personal",sshKey:{privateKey:$p,publicKey:$pub,keyFingerprint:"SHA256:GITHUB"}}'
                     ;;
                 ssh-work)
                     jq -cn --arg p "$work_private" --arg pub "$work_public" \
-                        '{id:"ssh-work",type:5,name:"work key; $(touch never)",sshKey:{privateKey:$p,publicKey:$pub,fingerprint:"SHA256:WORK"}}'
+                        '{id:"ssh-work",type:5,name:"work key; $(touch never)",sshKey:{privateKey:$p,publicKey:$pub,keyFingerprint:"SHA256:WORK"}}'
                     ;;
                 *) return 1 ;;
             esac
@@ -65,14 +65,21 @@ if [[ -n "${BWSSH_TEST_MODE:-}" ]]; then
             command cat
             ;;
         'create item')
-            [[ "${BWSSH_FAIL_COMMAND:-}" == create ]] && return 1
+            if [[ "${BWSSH_FAIL_COMMAND:-}" == create ]]; then
+                if [[ -n "${BWSSH_CREATE_PRIVATE_ERROR:-}" ]]; then
+                    print -u2 'privateKey=TEST_PRIVATE_IMPORT'
+                else
+                    print -u2 'Bitwarden test create failure.'
+                fi
+                return 1
+            fi
             item="$(<&0)" || return 1
             print -r -- "$item" | jq -e '
                 .type == 5
                 and (.name | length > 0)
                 and (.sshKey.privateKey == "TEST_PRIVATE_IMPORT")
                 and (.sshKey.publicKey == "ssh-ed25519 AAAATESTIMPORT import@test")
-                and (.sshKey.fingerprint == "SHA256:IMPORT")
+                and (.sshKey.keyFingerprint == "SHA256:IMPORT")
                 and (has("login") | not)
               ' >/dev/null || return 1
             print -r -- "$item" | jq -c '. + {id:"created-ssh"}'

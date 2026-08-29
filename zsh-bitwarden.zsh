@@ -1750,7 +1750,7 @@ _bwssh_metadata() {
         | [
             .id,
             (.name | gsub("[\\t\\r\\n]"; " ")),
-            (.sshKey.fingerprint // ""),
+            (.sshKey.keyFingerprint // .sshKey.fingerprint // ""),
             ((.sshKey.publicKey // "") | split(" ")[0])
           ]
         | @tsv
@@ -1768,7 +1768,7 @@ _bwssh_resolve_name() {
               .[0] | {
                 id,
                 name,
-                fingerprint: (.sshKey.fingerprint // ""),
+                fingerprint: (.sshKey.keyFingerprint // .sshKey.fingerprint // ""),
                 publicKey: (.sshKey.publicKey // "")
               }
             else error("SSH key name is missing or ambiguous") end
@@ -1829,6 +1829,18 @@ _bwssh_fingerprint_public_key() {
   REPLY="${fields[2]}"
 }
 
+_bwssh_filter_create_error() {
+  local line redacted=0
+  while IFS= read -r line; do
+    if [[ "$line" == *privateKey* || "$line" == *'PRIVATE KEY'* ]]; then
+      (( redacted )) || print -u2 'Bitwarden returned an error containing private-key data; details were redacted.'
+      redacted=1
+    else
+      print -u2 -r -- "$line"
+    fi
+  done
+}
+
 _bwssh_import() {
   _bwssh_require_vault_tools || return 1
   _bwssh_require ssh-keygen || return 1
@@ -1863,7 +1875,7 @@ _bwssh_import() {
     return 2
   fi
 
-  local public_key key_type fingerprint session duplicate created
+  local public_key key_type fingerprint session duplicate created write_public=1
   [[ -f "$private_path" && -r "$private_path" ]] || {
     print -u2 "Private key is not a readable regular file: $private_path"
     return 1
@@ -1894,7 +1906,7 @@ _bwssh_import() {
   duplicate="$(
     BW_SESSION="$session" bw list items 2>/dev/null \
       | jq -r --arg fingerprint "$fingerprint" \
-          'any(.[]; .type == 5 and .sshKey.fingerprint == $fingerprint)'
+          'any(.[]; .type == 5 and (.sshKey.keyFingerprint // .sshKey.fingerprint) == $fingerprint)'
   )" || {
     print -u2 'Unable to inspect existing Bitwarden SSH-key fingerprints.'
     return 1
@@ -1904,10 +1916,23 @@ _bwssh_import() {
     print -u2 'Use --force only after verifying that another item is intentional.'
     return 1
   fi
-  if [[ -n "$public_path" && -e "$public_path" && force -eq 0 ]]; then
-    print -u2 "Public-key output already exists: $public_path"
-    print -u2 'Use --force to overwrite it.'
+  if [[ -n "$public_path" && "${public_path:A}" == "${private_path:A}" ]]; then
+    print -u2 'The public-key output path must differ from the private-key input path.'
     return 1
+  fi
+  if [[ -n "$public_path" && -e "$public_path" ]]; then
+    local existing_public existing_fingerprint=""
+    existing_public="$(<"$public_path")" 2>/dev/null || true
+    if [[ -n "$existing_public" ]]; then
+      _bwssh_fingerprint_public_key "$existing_public" && existing_fingerprint="$REPLY"
+    fi
+    if [[ "$existing_fingerprint" == "$fingerprint" ]]; then
+      write_public=0
+    elif (( ! force )); then
+      print -u2 "Public-key output exists but does not match the private key: $public_path"
+      print -u2 'Choose another output path or use --force to overwrite it after import.'
+      return 1
+    fi
   fi
 
   if ! created="$(
@@ -1919,23 +1944,25 @@ _bwssh_import() {
           | .sshKey = {
               privateKey: $privateKey,
               publicKey: $publicKey,
-              fingerprint: $fingerprint
+              keyFingerprint: $fingerprint
             }
           | del(.login, .secureNote, .card, .identity)
         ' \
       | bw encode \
-      | BW_SESSION="$session" bw create item 2>/dev/null \
-      | jq -er '[.name, .sshKey.fingerprint] | @tsv'
+      | BW_SESSION="$session" bw create item 2> >(_bwssh_filter_create_error) \
+      | jq -er '[.name, (.sshKey.keyFingerprint // .sshKey.fingerprint)] | @tsv'
   )"; then
     print -u2 'Unable to create the Bitwarden SSH-key item.'
     return 1
   fi
-  if [[ -n "$public_path" ]]; then
+  if [[ -n "$public_path" && write_public -eq 1 ]]; then
     print -r -- "$public_key" >| "$public_path" || {
       print -u2 "The Bitwarden item was created, but the public key could not be written: $public_path"
       return 1
     }
     print "Public key written: $public_path"
+  elif [[ -n "$public_path" ]]; then
+    print "Public key already exists and matches: $public_path"
   fi
   print "Imported: ${created%%$'\t'*}  ${created#*$'\t'}"
   _bw_mutation_notice
@@ -1961,7 +1988,8 @@ _bwssh_load() {
   reply=("${loaded[@]}")
   local count=0 failed=0
   for id in "${ids[@]}"; do
-    item="$(BW_SESSION="$session" bw get item "$id" 2>/dev/null | jq -cer '{name, fingerprint: .sshKey.fingerprint}')" || {
+    item="$(BW_SESSION="$session" bw get item "$id" 2>/dev/null | jq -cer \
+      '{name, fingerprint: (.sshKey.keyFingerprint // .sshKey.fingerprint)}')" || {
       print -u2 "Unable to read Bitwarden SSH-key metadata for item $id."
       (( ++failed ))
       continue
@@ -2015,7 +2043,7 @@ _bwssh_unload() {
   local count=0 failed=0
   for id in "${ids[@]}"; do
     item="$(BW_SESSION="$session" bw get item "$id" 2>/dev/null | jq -cer \
-      '{name, fingerprint: .sshKey.fingerprint, publicKey: .sshKey.publicKey}')" || {
+      '{name, fingerprint: (.sshKey.keyFingerprint // .sshKey.fingerprint), publicKey: .sshKey.publicKey}')" || {
       print -u2 "Unable to read Bitwarden SSH-key metadata for item $id."
       (( ++failed ))
       continue
@@ -2123,7 +2151,8 @@ _bwssh_help() {
   case "${1:-}" in
     import) print -r -- 'Usage: bwssh import PRIVATE_KEY [--name NAME] [--public-key PATH] [--force]
 Validate an existing Ed25519 or RSA private key, derive its public key and SHA-256 fingerprint,
-and create a native Bitwarden SSH-key item. The private key is streamed to bw and is not deleted.' ;;
+and create a native Bitwarden SSH-key item. --public-key is an optional output path for the
+derived public key, not a second input. The source private key is not deleted.' ;;
     load) print -r -- 'Usage: bwssh load [--ttl DURATION] [NAME ...]
 Load selected Bitwarden private keys into the native OpenSSH agent over stdin.
 With no names, fzf provides multi-selection. BW_SSH_TTL supplies an optional default lifetime.' ;;
