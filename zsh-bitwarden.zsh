@@ -464,7 +464,7 @@ bw_lock() {
 
 bw_generate() {
   local -a larg uarg sarg narg lengtharg
-  zparseopts -D -F -K -- \
+  zparseopts -D -E -F -K -- \
              {l,-lowercase}=larg \
              {u,-uppercase}=uarg \
              {s,-special}=sarg \
@@ -1683,6 +1683,491 @@ bwenv() {
     esac
 }
 
+# -------------------------------------------------------------------
+# Bitwarden SSH keys and the native OpenSSH agent
+# -------------------------------------------------------------------
+
+BW_SSH_TTL="${BW_SSH_TTL:-}"
+
+_bwssh_require() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    print -u2 "bwssh requires '$1'."
+    return 1
+  fi
+}
+
+_bwssh_require_vault_tools() {
+  _bwssh_require bw && _bwssh_require jq
+}
+
+_bwssh_agent_list() {
+  [[ -n "${SSH_AUTH_SOCK:-}" ]] || return 2
+  command ssh-add -l -E sha256 2>/dev/null
+  local exit_code=$?
+  (( exit_code == 1 )) && return 0
+  return $exit_code
+}
+
+_bwssh_require_agent() {
+  _bwssh_require ssh-add || return 1
+  if [[ -z "${SSH_AUTH_SOCK:-}" ]]; then
+    print -u2 'No SSH agent is configured: SSH_AUTH_SOCK is empty.'
+    return 1
+  fi
+  _bwssh_agent_list >/dev/null || {
+    print -u2 'Unable to reach the SSH agent through SSH_AUTH_SOCK.'
+    return 1
+  }
+}
+
+_bwssh_loaded_fingerprints() {
+  local listing line
+  local -a fields
+  listing="$(_bwssh_agent_list)" || return $?
+  reply=()
+  for line in ${(f)listing}; do
+    fields=(${(z)line})
+    (( ${#fields} >= 2 )) && reply+=("${fields[2]}")
+  done
+}
+
+_bwssh_is_loaded() {
+  local fingerprint="$1" loaded
+  for loaded in "${reply[@]}"; do
+    [[ "$loaded" == "$fingerprint" ]] && return 0
+  done
+  return 1
+}
+
+_bwssh_metadata() {
+  local session="$1" search="${2:-}"
+  setopt localoptions pipefail
+  BW_SESSION="$session" bw list items 2>/dev/null \
+    | jq -er --arg search "$search" '
+        .[]
+        | select(.type == 5 and (.sshKey? | type == "object"))
+        | select($search == "" or (.name | test($search; "i")))
+        | [
+            .id,
+            (.name | gsub("[\\t\\r\\n]"; " ")),
+            (.sshKey.fingerprint // ""),
+            ((.sshKey.publicKey // "") | split(" ")[0])
+          ]
+        | @tsv
+      '
+}
+
+_bwssh_resolve_name() {
+  local session="$1" requested_name="$2"
+  setopt localoptions pipefail
+  REPLY="$(
+    BW_SESSION="$session" bw list items 2>/dev/null \
+      | jq -cer --arg name "$requested_name" '
+          [.[] | select(.type == 5 and .name == $name)]
+          | if length == 1 then
+              .[0] | {
+                id,
+                name,
+                fingerprint: (.sshKey.fingerprint // ""),
+                publicKey: (.sshKey.publicKey // "")
+              }
+            else error("SSH key name is missing or ambiguous") end
+        '
+  )" || {
+    print -u2 "Unable to find a unique Bitwarden SSH-key item named '$requested_name'."
+    print -u2 "Run 'bwvault sync' and retry if the item was added recently."
+    return 1
+  }
+}
+
+_bwssh_select_items() {
+  local session="$1" candidates selected line
+  _bwssh_require fzf || return 1
+  candidates="$(_bwssh_metadata "$session")" || {
+    print -u2 'Unable to list Bitwarden SSH-key items from the current vault data.'
+    print -u2 "Run 'bwvault sync' and retry if keys were added recently."
+    return 1
+  }
+  [[ -n "$candidates" ]] || {
+    print -u2 'No SSH-key items were found in the current Bitwarden vault data.'
+    return 1
+  }
+  selected="$(
+    print -r -- "$candidates" \
+      | fzf --multi --delimiter=$'\t' --with-nth=2,3,4 \
+            --header='Select SSH keys (private keys are never displayed)'
+  )"
+  if [[ $? -ne 0 || -z "$selected" ]]; then
+    return 130
+  fi
+  reply=()
+  for line in ${(f)selected}; do
+    reply+=("${line%%$'\t'*}")
+  done
+}
+
+_bwssh_source_items() {
+  local session="$1" requested_name
+  shift
+  reply=()
+  if (( $# == 0 )); then
+    _bwssh_select_items "$session" || return $?
+    return
+  fi
+  for requested_name in "$@"; do
+    _bwssh_resolve_name "$session" "$requested_name" || return 1
+    reply+=("$(jq -r '.id' <<< "$REPLY")")
+  done
+}
+
+_bwssh_fingerprint_public_key() {
+  local public_key="$1" details
+  details="$(print -r -- "$public_key" | ssh-keygen -lf - -E sha256 2>/dev/null)" || return 1
+  local -a fields
+  fields=(${(z)details})
+  (( ${#fields} >= 2 )) || return 1
+  REPLY="${fields[2]}"
+}
+
+_bwssh_import() {
+  _bwssh_require_vault_tools || return 1
+  _bwssh_require ssh-keygen || return 1
+  local private_path="" name="" public_path="" force=0
+  while (( $# > 0 )); do
+    case "$1" in
+      -n|--name)
+        (( $# >= 2 )) || { print -u2 "Missing value for $1."; return 2; }
+        name="$2"
+        shift 2
+        ;;
+      --public-key)
+        (( $# >= 2 )) || { print -u2 'Missing value for --public-key.'; return 2; }
+        public_path="$2"
+        shift 2
+        ;;
+      --force) force=1; shift ;;
+      --) shift ;;
+      -*) print -u2 "Unknown bwssh import option: $1"; return 2 ;;
+      *)
+        [[ -z "$private_path" ]] || {
+          print -u2 'bwssh import accepts exactly one private-key path.'
+          return 2
+        }
+        private_path="$1"
+        shift
+        ;;
+    esac
+  done
+  if [[ -z "$private_path" ]]; then
+    print -u2 'Usage: bwssh import PRIVATE_KEY [--name NAME] [--public-key PATH] [--force]'
+    return 2
+  fi
+
+  local public_key key_type fingerprint session duplicate created
+  [[ -f "$private_path" && -r "$private_path" ]] || {
+    print -u2 "Private key is not a readable regular file: $private_path"
+    return 1
+  }
+  [[ -n "$name" ]] || name="${private_path:t}"
+  public_key="$(ssh-keygen -y -f "$private_path")" || {
+    print -u2 "The input is not a supported private SSH key: $private_path"
+    return 1
+  }
+  key_type="${public_key%% *}"
+  case "$key_type" in
+    ssh-ed25519|ssh-rsa) ;;
+    *)
+      print -u2 "Unsupported SSH key type: $key_type (Bitwarden supports Ed25519 and RSA)."
+      return 1
+      ;;
+  esac
+  _bwssh_fingerprint_public_key "$public_key" || {
+    print -u2 'Unable to derive the public-key fingerprint.'
+    return 1
+  }
+  fingerprint="$REPLY"
+  setopt localoptions pipefail
+  session="$(_bw_session)" || {
+    print -u2 'Unable to unlock the Bitwarden CLI vault.'
+    return 1
+  }
+  duplicate="$(
+    BW_SESSION="$session" bw list items 2>/dev/null \
+      | jq -r --arg fingerprint "$fingerprint" \
+          'any(.[]; .type == 5 and .sshKey.fingerprint == $fingerprint)'
+  )" || {
+    print -u2 'Unable to inspect existing Bitwarden SSH-key fingerprints.'
+    return 1
+  }
+  if [[ "$duplicate" == true && force -eq 0 ]]; then
+    print -u2 "An SSH-key item with fingerprint $fingerprint already exists."
+    print -u2 'Use --force only after verifying that another item is intentional.'
+    return 1
+  fi
+  if [[ -n "$public_path" && -e "$public_path" && force -eq 0 ]]; then
+    print -u2 "Public-key output already exists: $public_path"
+    print -u2 'Use --force to overwrite it.'
+    return 1
+  fi
+
+  if ! created="$(
+    BW_SESSION="$session" bw get template item 2>/dev/null \
+      | jq -c --arg name "$name" --rawfile privateKey "$private_path" \
+          --arg publicKey "$public_key" --arg fingerprint "$fingerprint" '
+          .type = 5
+          | .name = $name
+          | .sshKey = {
+              privateKey: $privateKey,
+              publicKey: $publicKey,
+              fingerprint: $fingerprint
+            }
+          | del(.login, .secureNote, .card, .identity)
+        ' \
+      | bw encode \
+      | BW_SESSION="$session" bw create item 2>/dev/null \
+      | jq -er '[.name, .sshKey.fingerprint] | @tsv'
+  )"; then
+    print -u2 'Unable to create the Bitwarden SSH-key item.'
+    return 1
+  fi
+  if [[ -n "$public_path" ]]; then
+    print -r -- "$public_key" >| "$public_path" || {
+      print -u2 "The Bitwarden item was created, but the public key could not be written: $public_path"
+      return 1
+    }
+    print "Public key written: $public_path"
+  fi
+  print "Imported: ${created%%$'\t'*}  ${created#*$'\t'}"
+  _bw_mutation_notice
+}
+
+_bwssh_load() {
+  _bwssh_require_vault_tools || return 1
+  _bwssh_require_agent || return 1
+  local -a ttlarg names ids loaded
+  zparseopts -D -E -F -K -- -ttl:=ttlarg || return 2
+  names=("$@")
+  local ttl="${ttlarg[-1]:-${BW_SSH_TTL:-}}" session id item name fingerprint
+  local -a add_args stages
+  [[ -n "$ttl" ]] && add_args=(-t "$ttl")
+  session="$(_bw_session)" || {
+    print -u2 'Unable to unlock the Bitwarden CLI vault.'
+    return 1
+  }
+  _bwssh_source_items "$session" "${names[@]}" || return $?
+  ids=("${reply[@]}")
+  _bwssh_loaded_fingerprints || return 1
+  loaded=("${reply[@]}")
+  reply=("${loaded[@]}")
+  local count=0 failed=0
+  for id in "${ids[@]}"; do
+    item="$(BW_SESSION="$session" bw get item "$id" 2>/dev/null | jq -cer '{name, fingerprint: .sshKey.fingerprint}')" || {
+      print -u2 "Unable to read Bitwarden SSH-key metadata for item $id."
+      (( ++failed ))
+      continue
+    }
+    name="$(jq -r '.name' <<< "$item")"
+    fingerprint="$(jq -r '.fingerprint // ""' <<< "$item")"
+    if [[ -n "$fingerprint" ]] && _bwssh_is_loaded "$fingerprint"; then
+      print "Already loaded: $name  $fingerprint"
+      continue
+    fi
+    setopt localoptions pipefail
+    BW_SESSION="$session" bw get item "$id" 2>/dev/null \
+      | jq -er '.sshKey.privateKey | select(length > 0)' \
+      | ssh-add "${add_args[@]}" -
+    stages=("${pipestatus[@]}")
+    if ! _bw_pipefail "${stages[@]}"; then
+      print -u2 "Unable to load SSH key: $name"
+      (( ++failed ))
+      continue
+    fi
+    print "Loaded: $name${fingerprint:+  $fingerprint}"
+    (( ++count ))
+  done
+  (( count > 0 || failed == 0 )) && (( failed == 0 ))
+}
+
+_bwssh_unload() {
+  _bwssh_require_agent || return 1
+  local -a allarg names ids loaded
+  zparseopts -D -E -F -K -- -all=allarg || return 2
+  if (( ${#allarg} )); then
+    (( $# == 0 )) || {
+      print -u2 'bwssh unload --all does not accept key names.'
+      return 2
+    }
+    ssh-add -D
+    return $?
+  fi
+  _bwssh_require_vault_tools || return 1
+  names=("$@")
+  local session id item name fingerprint public_key
+  session="$(_bw_session)" || {
+    print -u2 'Unable to unlock the Bitwarden CLI vault.'
+    return 1
+  }
+  _bwssh_source_items "$session" "${names[@]}" || return $?
+  ids=("${reply[@]}")
+  _bwssh_loaded_fingerprints || return 1
+  loaded=("${reply[@]}")
+  reply=("${loaded[@]}")
+  local count=0 failed=0
+  for id in "${ids[@]}"; do
+    item="$(BW_SESSION="$session" bw get item "$id" 2>/dev/null | jq -cer \
+      '{name, fingerprint: .sshKey.fingerprint, publicKey: .sshKey.publicKey}')" || {
+      print -u2 "Unable to read Bitwarden SSH-key metadata for item $id."
+      (( ++failed ))
+      continue
+    }
+    name="$(jq -r '.name' <<< "$item")"
+    fingerprint="$(jq -r '.fingerprint // ""' <<< "$item")"
+    public_key="$(jq -r '.publicKey // ""' <<< "$item")"
+    if [[ -n "$fingerprint" ]] && ! _bwssh_is_loaded "$fingerprint"; then
+      print "Not loaded: $name  $fingerprint"
+      continue
+    fi
+    if [[ -z "$public_key" ]] || ! print -r -- "$public_key" | ssh-add -d -; then
+      print -u2 "Unable to unload '$name' by public key. This OpenSSH may not support 'ssh-add -d -'."
+      print -u2 "Use 'bwssh unload --all' or 'ssh-add -d /path/to/public-key'."
+      (( ++failed ))
+      continue
+    fi
+    print "Unloaded: $name${fingerprint:+  $fingerprint}"
+    (( ++count ))
+  done
+  (( count > 0 || failed == 0 )) && (( failed == 0 ))
+}
+
+_bwssh_list() {
+  _bwssh_require_vault_tools || return 1
+  local search=""
+  while (( $# > 0 )); do
+    case "$1" in
+      -s|--search)
+        (( $# >= 2 )) || { print -u2 "Missing value for $1."; return 2; }
+        search="$2"
+        shift 2
+        ;;
+      --) shift ;;
+      *) print -u2 'Usage: bwssh list [--search TEXT]'; return 2 ;;
+    esac
+  done
+  local session metadata line marker id name fingerprint key_type
+  session="$(_bw_session)" || {
+    print -u2 'Unable to unlock the Bitwarden CLI vault.'
+    return 1
+  }
+  metadata="$(_bwssh_metadata "$session" "$search")" || {
+    print -u2 'Unable to list Bitwarden SSH-key items.'
+    return 1
+  }
+  [[ -n "$metadata" ]] || {
+    print -u2 'No matching Bitwarden SSH-key items were found.'
+    return 1
+  }
+  _bwssh_loaded_fingerprints || reply=()
+  print -r -- $'loaded\tname\tfingerprint\ttype'
+  for line in ${(f)metadata}; do
+    IFS=$'\t' read -r id name fingerprint key_type <<< "$line"
+    marker='-'
+    [[ -n "$fingerprint" ]] && _bwssh_is_loaded "$fingerprint" && marker='yes'
+    print -r -- "$marker"$'\t'"$name"$'\t'"$fingerprint"$'\t'"$key_type"
+  done | column -t -s $'\t'
+}
+
+_bwssh_status() {
+  _bwssh_require bw || return 1
+  _bwssh_require jq || return 1
+  local vault_status agent_listing session metadata line id name fingerprint key_type
+  vault_status="$(bw status 2>/dev/null | jq -r '.status // "unavailable"')" || vault_status=unavailable
+  print "Vault: $vault_status"
+  if agent_listing="$(_bwssh_agent_list)"; then
+    print 'SSH agent: available'
+  else
+    print 'SSH agent: unavailable'
+  fi
+  if [[ -z "${BW_SESSION:-}" ]]; then
+    print 'Stored keys: unavailable without an existing BW_SESSION (status does not unlock the vault)'
+    [[ "$agent_listing" == '' ]] || print -r -- "$agent_listing"
+    return 0
+  fi
+  session="$BW_SESSION"
+  metadata="$(_bwssh_metadata "$session")" || {
+    print 'Stored keys: unavailable with the current BW_SESSION'
+    return 1
+  }
+  _bwssh_loaded_fingerprints || reply=()
+  print 'Loaded keys:'
+  local loaded_count=0 unloaded_count=0
+  for line in ${(f)metadata}; do
+    IFS=$'\t' read -r id name fingerprint key_type <<< "$line"
+    if [[ -n "$fingerprint" ]] && _bwssh_is_loaded "$fingerprint"; then
+      print "  loaded  $name  $fingerprint"
+      (( ++loaded_count ))
+    fi
+  done
+  (( loaded_count > 0 )) || print '  <none>'
+  print 'Stored but unloaded:'
+  for line in ${(f)metadata}; do
+    IFS=$'\t' read -r id name fingerprint key_type <<< "$line"
+    if [[ -z "$fingerprint" ]] || ! _bwssh_is_loaded "$fingerprint"; then
+      print "  -  $name  $fingerprint"
+      (( ++unloaded_count ))
+    fi
+  done
+  (( unloaded_count > 0 )) || print '  <none>'
+}
+
+_bwssh_help() {
+  case "${1:-}" in
+    import) print -r -- 'Usage: bwssh import PRIVATE_KEY [--name NAME] [--public-key PATH] [--force]
+Validate an existing Ed25519 or RSA private key, derive its public key and SHA-256 fingerprint,
+and create a native Bitwarden SSH-key item. The private key is streamed to bw and is not deleted.' ;;
+    load) print -r -- 'Usage: bwssh load [--ttl DURATION] [NAME ...]
+Load selected Bitwarden private keys into the native OpenSSH agent over stdin.
+With no names, fzf provides multi-selection. BW_SSH_TTL supplies an optional default lifetime.' ;;
+    unload) print -r -- 'Usage: bwssh unload [NAME ...]
+       bwssh unload --all
+Remove selected identities by streaming public keys to ssh-add -d -, or remove every identity.
+Bitwarden items are never changed.' ;;
+    list) print -r -- 'Usage: bwssh list [--search TEXT]
+List non-secret SSH-key metadata and whether each fingerprint is loaded in the current agent.' ;;
+    status) print -r -- 'Usage: bwssh status
+Show Bitwarden CLI and native agent availability without unlocking the vault.
+Stored-key details are included only when BW_SESSION is already set.' ;;
+    *) print -r -- 'Usage: bwssh <command> [arguments]
+
+Commands:
+  import   import an existing private key as a native Bitwarden SSH-key item
+  load     load one or more keys into the native OpenSSH agent
+  unload   remove selected or all identities from the agent
+  list     list safe vault metadata and loaded state
+  status   show vault and agent availability without unlocking
+  help     show this help or help for a command
+
+Reads never sync automatically. Run `bwvault sync` explicitly when vault data may be stale.' ;;
+  esac
+}
+
+bwssh() {
+  local command_name="${1:-help}"
+  (( $# > 0 )) && shift
+  case "$command_name" in
+    import) _bwssh_import "$@" ;;
+    load) _bwssh_load "$@" ;;
+    unload) _bwssh_unload "$@" ;;
+    list) _bwssh_list "$@" ;;
+    status) _bwssh_status "$@" ;;
+    help|-h|--help) _bwssh_help "${1:-}" ;;
+    *)
+      print -u2 "Unknown bwssh command: $command_name"
+      print -u2 "Run 'bwssh help' to see available commands."
+      return 2
+      ;;
+  esac
+}
+
 _bw_group_help() {
   case "$1" in
     vault)
@@ -1890,6 +2375,8 @@ bwdoctor() {
   _bwdoctor_clipboard || (( ++failed ))
 
   command -v yq >/dev/null 2>&1 && print 'optional: yq available' || print 'optional: yq missing (required only for bwnote yaml)'
+  command -v ssh-add >/dev/null 2>&1 && print 'optional: ssh-add available' || print 'optional: ssh-add missing (required only for bwssh)'
+  command -v ssh-keygen >/dev/null 2>&1 && print 'optional: ssh-keygen available' || print 'optional: ssh-keygen missing (required only for bwssh import)'
   if [[ -x "$BWENV_KEYRING_BIN" ]] && BWENV_KEYRING_SERVICE="$BWENV_KEYRING_SERVICE" "$BWENV_KEYRING_BIN" status >/dev/null 2>&1; then
     print 'optional: Python keyring backend available'
   else

@@ -1,0 +1,28 @@
+#!/usr/bin/env zsh
+
+[[ -n "${BWSSH_TEST_SSH_KEYGEN_LOG:-}" ]] && print -r -- "$*" >> "$BWSSH_TEST_SSH_KEYGEN_LOG"
+[[ -n "${BWSSH_FAIL_SSH_KEYGEN:-}" ]] && return 1
+
+if [[ "$1" == -y && "$2" == -f ]]; then
+    [[ -f "$3" ]] || return 1
+    content="$(<"$3")"
+    [[ "$content" == *INVALID* ]] && return 1
+    case "$content" in
+        *TEST_PRIVATE_IMPORT*) print -r -- 'ssh-ed25519 AAAATESTIMPORT import@test' ;;
+        *) return 1 ;;
+    esac
+    return
+fi
+
+if [[ "$1" == -lf && "$2" == - && "$3" == -E && "$4" == sha256 ]]; then
+    public_key="$(<&0)"
+    case "$public_key" in
+        *AAAATESTIMPORT*) print -r -- '256 SHA256:IMPORT import@test (ED25519)' ;;
+        *AAAATESTGITHUB*) print -r -- '256 SHA256:GITHUB github@test (ED25519)' ;;
+        *AAAATESTWORK*) print -r -- '4096 SHA256:WORK work@test (RSA)' ;;
+        *) return 1 ;;
+    esac
+    return
+fi
+
+return 2

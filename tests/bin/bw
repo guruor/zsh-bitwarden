@@ -1,10 +1,88 @@
 #!/usr/bin/env zsh
 
-[[ -n "${BWENV_TEST_LOG:-}" ]] && print -r -- "$*" >> "$BWENV_TEST_LOG"
+if [[ -n "${BWSSH_TEST_LOG:-}" ]]; then
+    print -r -- "$*" >> "$BWSSH_TEST_LOG"
+elif [[ -n "${BWENV_TEST_LOG:-}" ]]; then
+    print -r -- "$*" >> "$BWENV_TEST_LOG"
+fi
 
 if [[ "$1" == --version ]]; then
     print -r -- 'test-bw 1.0'
     return 0
+fi
+
+if [[ -n "${BWSSH_TEST_MODE:-}" ]]; then
+    [[ "${BWSSH_FAIL_COMMAND:-}" == "$1" ]] && return 1
+    github_private='TEST_PRIVATE_GITHUB'
+    work_private='TEST_PRIVATE_WORK'
+    github_public='ssh-ed25519 AAAATESTGITHUB github@test'
+    work_public='ssh-rsa AAAATESTWORK work@test'
+    case "$1 $2" in
+        'status ')
+            print -r -- "{\"status\":\"${BWSSH_VAULT_STATUS:-unlocked}\"}"
+            ;;
+        'unlock --raw')
+            [[ "${BWSSH_FAIL_COMMAND:-}" == unlock ]] && return 1
+            print -r -- 'test-session'
+            ;;
+        'list items')
+            [[ "${BWSSH_FAIL_COMMAND:-}" == list ]] && return 1
+            jq -cn \
+                --arg gp "$github_private" --arg gpub "$github_public" \
+                --arg wp "$work_private" --arg wpub "$work_public" \
+                --argjson duplicate "${BWSSH_DUPLICATE_IMPORT:-false}" '
+                [
+                  {id:"ssh-github", type:5, name:"github-personal",
+                   sshKey:{privateKey:$gp, publicKey:$gpub, fingerprint:"SHA256:GITHUB"}},
+                  {id:"ssh-work", type:5, name:"work key; $(touch never)",
+                   sshKey:{privateKey:$wp, publicKey:$wpub, fingerprint:"SHA256:WORK"}},
+                  {id:"login", type:1, name:"ordinary", login:{password:"NOT_AN_SSH_KEY"}}
+                ]
+                + (if $duplicate then [{id:"ssh-import", type:5, name:"existing-import",
+                    sshKey:{privateKey:"HIDDEN", publicKey:"ssh-ed25519 AAAATESTIMPORT import@test",
+                            fingerprint:"SHA256:IMPORT"}}] else [] end)
+              '
+            ;;
+        'get item')
+            [[ "${BWSSH_FAIL_COMMAND:-}" == get ]] && return 1
+            case "$3" in
+                ssh-github)
+                    jq -cn --arg p "$github_private" --arg pub "$github_public" \
+                        '{id:"ssh-github",type:5,name:"github-personal",sshKey:{privateKey:$p,publicKey:$pub,fingerprint:"SHA256:GITHUB"}}'
+                    ;;
+                ssh-work)
+                    jq -cn --arg p "$work_private" --arg pub "$work_public" \
+                        '{id:"ssh-work",type:5,name:"work key; $(touch never)",sshKey:{privateKey:$p,publicKey:$pub,fingerprint:"SHA256:WORK"}}'
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+        'get template')
+            [[ "${BWSSH_FAIL_COMMAND:-}" == template ]] && return 1
+            print -r -- '{"type":1,"name":"","login":{},"secureNote":{},"card":{},"identity":{}}'
+            ;;
+        'encode ')
+            command cat
+            ;;
+        'create item')
+            [[ "${BWSSH_FAIL_COMMAND:-}" == create ]] && return 1
+            item="$(<&0)" || return 1
+            print -r -- "$item" | jq -e '
+                .type == 5
+                and (.name | length > 0)
+                and (.sshKey.privateKey == "TEST_PRIVATE_IMPORT")
+                and (.sshKey.publicKey == "ssh-ed25519 AAAATESTIMPORT import@test")
+                and (.sshKey.fingerprint == "SHA256:IMPORT")
+                and (has("login") | not)
+              ' >/dev/null || return 1
+            print -r -- "$item" | jq -c '. + {id:"created-ssh"}'
+            ;;
+        *)
+            print -u2 "Unexpected fake bw SSH invocation: $*"
+            return 2
+            ;;
+    esac
+    return
 fi
 
 case "$1 $2" in

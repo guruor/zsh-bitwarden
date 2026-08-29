@@ -1,0 +1,49 @@
+#!/usr/bin/env zsh
+
+[[ -n "${BWSSH_TEST_SSH_ADD_LOG:-}" ]] && print -r -- "$*" >> "$BWSSH_TEST_SSH_ADD_LOG"
+[[ -n "${BWSSH_FAIL_SSH_ADD:-}" ]] && return 2
+state="${BWSSH_TEST_AGENT_STATE:?}"
+
+case "$1" in
+    -l)
+        if [[ ! -s "$state" ]]; then
+            return 1
+        fi
+        while IFS= read -r fingerprint; do
+            case "$fingerprint" in
+                SHA256:GITHUB) print -r -- '256 SHA256:GITHUB github@test (ED25519)' ;;
+                SHA256:WORK) print -r -- '4096 SHA256:WORK work@test (RSA)' ;;
+                SHA256:IMPORT) print -r -- '256 SHA256:IMPORT import@test (ED25519)' ;;
+            esac
+        done < "$state"
+        ;;
+    -D)
+        : > "$state"
+        print -r -- 'All identities removed.'
+        ;;
+    -d)
+        [[ "$2" == - ]] || return 2
+        public_key="$(<&0)"
+        case "$public_key" in
+            *AAAATESTGITHUB*) target='SHA256:GITHUB' ;;
+            *AAAATESTWORK*) target='SHA256:WORK' ;;
+            *) return 1 ;;
+        esac
+        lines=(${(f)"$(<"$state")"})
+        : > "$state"
+        for line in "${lines[@]}"; do
+            [[ "$line" == "$target" ]] || print -r -- "$line" >> "$state"
+        done
+        print -r -- 'Identity removed.'
+        ;;
+    *)
+        key="$(<&0)"
+        case "$key" in
+            *TEST_PRIVATE_GITHUB*) fingerprint='SHA256:GITHUB' ;;
+            *TEST_PRIVATE_WORK*) fingerprint='SHA256:WORK' ;;
+            *) return 1 ;;
+        esac
+        print -r -- "$fingerprint" >> "$state"
+        print -r -- 'Identity added.'
+        ;;
+esac

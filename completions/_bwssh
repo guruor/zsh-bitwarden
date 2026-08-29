@@ -1,0 +1,42 @@
+#compdef bwssh
+
+local -a commands
+commands=(
+  'import:import an OpenSSH private key into Bitwarden'
+  'load:load Bitwarden SSH keys into the native ssh-agent'
+  'unload:remove identities from the native ssh-agent'
+  'list:list Bitwarden SSH-key metadata'
+  'status:show Bitwarden and native ssh-agent status'
+  'help:show command-specific help'
+)
+
+if (( CURRENT == 2 )); then
+  _describe 'bwssh command' commands
+  return
+fi
+
+case "${words[2]}" in
+  import)
+    _arguments \
+      '(-n --name)'{-n,--name}'[Bitwarden item name]:name:' \
+      '--public-key[write the derived public key]:public key file:_files' \
+      '--force[allow a duplicate fingerprint and overwrite public-key output]' \
+      '1:private key file:_files'
+    ;;
+  load)
+    _arguments \
+      '--ttl[ssh-agent key lifetime]:duration:' \
+      '*:Bitwarden SSH-key name:'
+    ;;
+  unload)
+    _arguments \
+      '--all[remove every identity from the current agent]' \
+      '*:Bitwarden SSH-key name:'
+    ;;
+  list)
+    _arguments '(-s --search)'{-s,--search}'[filter item names]:text:'
+    ;;
+  help)
+    _values 'bwssh command' import load unload list status
+    ;;
+esac

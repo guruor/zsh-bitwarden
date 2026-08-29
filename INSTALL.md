@@ -38,6 +38,8 @@ plugins=(... zsh-bitwarden)
 
 `bwnote yaml` requires `yq`.
 
+`bwssh` requires the operating system's OpenSSH `ssh-add` and `ssh-keygen` commands. A native agent must already be running and reachable through `SSH_AUTH_SOCK`; the plugin does not start or configure one. These commands are available from standard OpenSSH packages on macOS, Linux, and Android/Termux.
+
 `bwenv store`, `bwenv load`, and `bwenv remove` require Python [`keyring`](https://pypi.org/project/keyring/) in the same Python installation used by `bin/bwenv-keyring`:
 
 ```sh
@@ -51,4 +53,5 @@ Reload Zsh and verify the installation:
 ```zsh
 bwdoctor
 bwenv doctor
+bwssh status
 ```

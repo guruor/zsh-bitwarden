@@ -9,9 +9,10 @@ fpath=("${0:h}/completions" $fpath)
 source "${0:h}/zsh-bitwarden.zsh"
 
 if (( $+functions[compdef] )); then
-  autoload -Uz _bwenv _bwvault _bwitem _bwnote
+  autoload -Uz _bwenv _bwvault _bwitem _bwnote _bwssh
   compdef _bwenv bwenv
   compdef _bwvault bwvault
   compdef _bwitem bwitem
   compdef _bwnote bwnote
+  compdef _bwssh bwssh
 fi

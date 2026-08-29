@@ -42,6 +42,11 @@ bw_add_field() { record bw_add_field "$@"; }
 bw_create_note() { record bw_create_note "$@"; }
 bw_edit_note() { record bw_edit_note "$@"; }
 bw_notes_field_edit_as_yaml() { record bw_notes_field_edit_as_yaml "$@"; }
+_bwssh_import() { record _bwssh_import "$@"; }
+_bwssh_load() { record _bwssh_load "$@"; }
+_bwssh_unload() { record _bwssh_unload "$@"; }
+_bwssh_list() { record _bwssh_list "$@"; }
+_bwssh_status() { record _bwssh_status "$@"; }
 
 bwvault unlock
 bwvault status
@@ -59,6 +64,11 @@ bwnote get infrastructure
 bwnote create --name infrastructure
 bwnote edit infrastructure
 bwnote yaml infrastructure
+bwssh import '/key path' --name example
+bwssh load example --ttl 10h
+bwssh unload example
+bwssh list --search example
+bwssh status
 
 calls="$(<"$CALL_LOG")"
 for expected in \
@@ -80,6 +90,15 @@ for expected in \
   [[ "$calls" == *"$expected"* ]] || fail "missing dispatch: $expected"
 done
 
+for expected in \
+  '_bwssh_import /key path --name example' \
+  '_bwssh_load example --ttl 10h' \
+  '_bwssh_unload example' \
+  '_bwssh_list --search example' \
+  '_bwssh_status'; do
+  [[ "$calls" == *"$expected"* ]] || fail "missing bwssh dispatch: $expected"
+done
+
 for old_alias in bwul bwst bwpw bwus bwno bwg bwlc bwnc bwexp bwsync; do
   (( ! $+aliases[$old_alias] )) || fail "legacy alias remains: $old_alias"
 done
@@ -88,13 +107,15 @@ done
 [[ "${_comps[bwvault]}" == _bwvault ]] || fail 'bwvault completion is not registered'
 [[ "${_comps[bwitem]}" == _bwitem ]] || fail 'bwitem completion is not registered'
 [[ "${_comps[bwnote]}" == _bwnote ]] || fail 'bwnote completion is not registered'
+[[ "${_comps[bwssh]}" == _bwssh ]] || fail 'bwssh completion is not registered'
 
 ROOT="$ROOT" zsh -f -c '
   source "$ROOT/zsh-bitwarden.plugin.zsh"
   autoload -Uz compinit
   compinit -D
   [[ ${_comps[bwenv]} == _bwenv && ${_comps[bwvault]} == _bwvault &&
-     ${_comps[bwitem]} == _bwitem && ${_comps[bwnote]} == _bwnote ]]
+     ${_comps[bwitem]} == _bwitem && ${_comps[bwnote]} == _bwnote &&
+     ${_comps[bwssh]} == _bwssh ]]
 ' || fail 'completion failed when the plugin loaded before compinit'
 
 temp_secret="$(print -rn -- 'temporary-test-value' | bw_init_file)"

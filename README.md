@@ -1,6 +1,6 @@
 # zsh-bitwarden
 
-Interactive Zsh workflows on top of the official [Bitwarden CLI](https://github.com/bitwarden/clients/tree/main/apps/cli). The plugin keeps `bw` available for complete CLI access and adds `fzf` selection, structured-note editing, environment-secret loading, and shell completion.
+Interactive Zsh workflows on top of the official [Bitwarden CLI](https://github.com/bitwarden/clients/tree/main/apps/cli). The plugin keeps `bw` available for complete CLI access and adds `fzf` selection, structured-note editing, environment-secret loading, native SSH-agent key loading, and shell completion.
 
 ## Install
 
@@ -31,6 +31,7 @@ bwvault help
 bwitem help
 bwnote help
 bwenv help
+bwssh help
 ```
 
 ### Vault
@@ -103,13 +104,71 @@ Set `BW_ENV_SECRETS="OPENAI_API_KEY GITHUB_TOKEN"` for default names. Without ar
 
 Keyring storage is intentionally limited to explicit environment values. Caching complete Bitwarden items would duplicate structured decrypted vault data and create stale copies. `bwenv store/load/remove` use Python [`keyring`](https://pypi.org/project/keyring/) for macOS Keychain, Linux Secret Service/KWallet, or Windows Credential Manager; see [INSTALL.md](INSTALL.md).
 
+### SSH keys
+
+`bwssh` keeps private keys in native Bitwarden SSH-key items and streams them into the operating system's OpenSSH `ssh-agent`. It does not use the Bitwarden Desktop SSH Agent, copy keys into the `bwenv` keyring, start an agent, or write retrieved private keys to files.
+
+```zsh
+# Import an existing key once. The source file is not deleted.
+bwssh import ~/.ssh/id_ed25519 --name github-personal \
+  --public-key ~/.ssh/public-keys/github-personal.pub
+
+# After login/reboot, agent restart, or TTL expiry:
+bwssh load
+
+# Then use SSH-backed tools normally.
+git pull
+git push
+ssh production
+
+bwssh list
+bwssh status
+bwssh unload github-personal
+bwssh unload --all
+```
+
+With no names, `bwssh load` and `bwssh unload` use safe `fzf --multi` selection. Only item IDs, names, fingerprints, and public-key types reach `fzf`. Set `BW_SSH_TTL=10h` for a default native agent lifetime, or use `bwssh load github-personal --ttl 10h`. With no TTL, `ssh-add` uses its native default behavior.
+
+Bitwarden is the durable encrypted source of truth. The native agent is temporary runtime storage, so loading must be repeated after its identities disappear. Private-key data necessarily passes through the memory of `bw`, `jq`, the plugin pipeline, and `ssh-add`, but it is not intentionally persisted by `bwssh`.
+
+OpenSSH remains responsible for host-to-identity selection. Public keys and SSH configuration can remain in dotfiles:
+
+```sshconfig
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/public-keys/github-personal.pub
+    IdentitiesOnly yes
+
+Host production
+    HostName prod.example.com
+    User ubuntu
+    IdentityFile ~/.ssh/public-keys/production.pub
+    IdentitiesOnly yes
+```
+
+`bwssh` does not parse or modify `~/.ssh/config`. Selected unload uses `ssh-add -d -` with public-key material. If the installed OpenSSH does not support that form, use `bwssh unload --all` or `ssh-add -d /path/to/public-key`.
+
+#### Existing-key migration
+
+1. Keep the existing private key in place during migration, for example `~/.ssh/id_rsa`.
+2. Import it with `bwssh import ~/.ssh/id_rsa --name github-personal --public-key ~/.ssh/public-keys/github-personal.pub`.
+3. Load it with `bwssh load github-personal --ttl 10h`.
+4. Verify with `ssh-add -l` and the relevant connection, such as `ssh -T git@github.com`.
+5. Change `IdentityFile` to the exported public key and set `IdentitiesOnly yes`.
+6. Verify normal Git and SSH operations again.
+7. Only then manually remove the old private-key file. The plugin never deletes it or rewrites Git history.
+
+Deleting a private key from the current working tree does not remove it from existing Git commits. If it was ever committed, purge it from Git history separately and rotate the exposed key.
+
 ## Security
 
 - No command synchronizes automatically.
 - Secrets sent to the keyring helper travel over stdin, not command arguments.
 - Completion never queries or unlocks the vault.
 - Keyring loading does not contact Bitwarden or expose values in command output.
-- Repository tests use fake `bw`, `fzf`, and keyring executables and never access a real vault.
+- SSH private keys are streamed to `ssh-add` over stdin and are never stored in the OS keyring or plugin state.
+- Repository tests use fake `bw`, `fzf`, OpenSSH, and keyring executables and never access a real vault or user SSH key.
 
 ## Acknowledgements
 

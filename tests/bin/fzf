@@ -5,10 +5,18 @@ if [[ "$1" == --version ]]; then
     return 0
 fi
 
-local first_line line
+local first_line line output=''
 while IFS= read -r line; do
-    print -r -- "$line" >> "$BWENV_TEST_FZF_LOG"
+    if [[ -n "${BWENV_TEST_FZF_LOG:-}" ]]; then
+        print -r -- "$line" >> "$BWENV_TEST_FZF_LOG"
+    elif [[ -n "${BWSSH_TEST_FZF_LOG:-}" ]]; then
+        print -r -- "$line" >> "$BWSSH_TEST_FZF_LOG"
+    fi
     [[ -n "$first_line" ]] || first_line="$line"
+    if [[ -n "${BWSSH_FZF_ALL:-}" ]]; then
+        [[ -n "$output" ]] && output+=$'\n'
+        output+="$line"
+    fi
 done
 [[ -n "$first_line" ]] || return 1
-print -r -- "$first_line"
+print -r -- "${output:-$first_line}"
