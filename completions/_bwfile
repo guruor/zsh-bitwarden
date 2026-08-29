@@ -23,7 +23,7 @@ case "${words[2]}" in
       '--lifecycle[file lifecycle]:lifecycle:(provision recovery)' \
       '--mode[safe four-digit octal mode]:mode:(0600 0400 0640 0440)' \
       '--description[non-secret description]:description:' \
-      '(- 1 *)'{--force,--update}'[update an existing item]' \
+      {--force,--update}'[update an existing item]' \
       '1:secret file:_files'
     ;;
   load)

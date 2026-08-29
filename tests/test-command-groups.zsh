@@ -141,6 +141,49 @@ ROOT="$ROOT" zsh -f -c '
      ${_comps[bwssh]} == _bwssh ]]
 ' || fail 'completion failed when the plugin loaded before compinit'
 
+# Exercise completion branches without invoking Bitwarden or an interactive widget.
+typeset -ga completion_specs
+_arguments() { completion_specs=("$@"); }
+_values() { completion_specs=("$@"); }
+_describe() { completion_specs=("$@"); }
+_bwfile_completion_under_test() { source "$ROOT/completions/_bwfile"; }
+
+words=(bwfile save)
+CURRENT=3
+completion_specs=()
+_bwfile_completion_under_test
+save_specs="${(j: :)completion_specs}"
+for expected in '--name' '--lifecycle' '--mode' '--description' '--force' '--update' '_files'; do
+  [[ "$save_specs" == *"$expected"* ]] || fail "bwfile save completion is missing: $expected"
+done
+[[ "$save_specs" != *'(- 1 *)--force'* ]] || fail 'bwfile save --force incorrectly excludes the file argument'
+
+words=(bwfile load)
+completion_specs=()
+_bwfile_completion_under_test
+load_specs="${(j: :)completion_specs}"
+for expected in '--force' '--all' '--lifecycle' 'logical name'; do
+  [[ "$load_specs" == *"$expected"* ]] || fail "bwfile load completion is missing: $expected"
+done
+
+words=(bwfile list)
+completion_specs=()
+_bwfile_completion_under_test
+[[ "${(j: :)completion_specs}" == *'--search'* ]] || fail 'bwfile list completion is missing --search'
+
+words=(bwfile remove)
+completion_specs=()
+_bwfile_completion_under_test
+[[ "${(j: :)completion_specs}" == *'--force'* ]] || fail 'bwfile remove completion is missing --force'
+
+words=(bwfile help)
+completion_specs=()
+_bwfile_completion_under_test
+help_specs="${(j: :)completion_specs}"
+for expected in save load list show status remove; do
+  [[ "$help_specs" == *"$expected"* ]] || fail "bwfile help completion is missing: $expected"
+done
+
 temp_secret="$(print -rn -- 'temporary-test-value' | bw_init_file)"
 EDITOR=false
 if bw_edit_file "$temp_secret"; then
