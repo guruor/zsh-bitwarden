@@ -68,6 +68,7 @@ if bwfile save "$binary" > "$output" 2> "$error"; then fail 'binary save succeed
 assert_contains "$(<"$error")" 'textual files'
 if bwfile save "$empty" --name PUBLIC_MODE --mode 0644 > "$output" 2> "$error"; then fail 'other-readable mode succeeded'; fi
 assert_contains "$(<"$error")" 'Unsafe mode'
+assert_contains "$(<"$error")" "--mode 0600"
 if bwfile save "$empty" --name NEWLINE_DESCRIPTION --description $'line one\nline two' > "$output" 2> "$error"; then fail 'control-character description succeeded'; fi
 assert_contains "$(<"$error")" 'unsupported metadata characters'
 if bwfile save "$HOME/.config" > "$output" 2> "$error"; then fail 'directory save succeeded'; fi

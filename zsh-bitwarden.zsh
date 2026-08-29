@@ -1882,7 +1882,11 @@ _bwfile_save() {
   [[ "$lifecycle" == provision || "$lifecycle" == recovery ]] || { print -u2 "Invalid lifecycle: $lifecycle"; return 2; }
   [[ -n "$mode" ]] || mode="$(_bwfile_file_mode "$payload_source")" || { print -u2 "Unable to determine source permissions: $payload_source"; return 1; }
   [[ "$mode" == 0* ]] || mode="0$mode"
-  _bwfile_valid_mode "$mode" || { print -u2 "Unsafe mode '$mode': only owner read/write and optional group read are allowed."; return 1; }
+  _bwfile_valid_mode "$mode" || {
+    print -u2 "Unsafe mode '$mode': only owner read/write and optional group read are allowed."
+    print -u2 "Retry with '--mode 0600' to store a secure restore mode without changing the source file."
+    return 1
+  }
 
   local absolute configured item_name metadata session matches count id result
   absolute="${source:a}"
