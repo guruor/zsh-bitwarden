@@ -47,6 +47,12 @@ _bwssh_load() { record _bwssh_load "$@"; }
 _bwssh_unload() { record _bwssh_unload "$@"; }
 _bwssh_list() { record _bwssh_list "$@"; }
 _bwssh_status() { record _bwssh_status "$@"; }
+_bwfile_save() { record _bwfile_save "$@"; }
+_bwfile_load() { record _bwfile_load "$@"; }
+_bwfile_list() { record _bwfile_list "$@"; }
+_bwfile_show() { record _bwfile_show "$@"; }
+_bwfile_status() { record _bwfile_status "$@"; }
+_bwfile_remove() { record _bwfile_remove "$@"; }
 
 bwvault unlock
 bwvault status
@@ -69,6 +75,12 @@ bwssh load example --ttl 10h
 bwssh unload example
 bwssh list --search example
 bwssh status
+bwfile save '/secret path' --name example
+bwfile load example
+bwfile list --search example
+bwfile show example
+bwfile status
+bwfile remove example --force
 
 calls="$(<"$CALL_LOG")"
 for expected in \
@@ -91,6 +103,16 @@ for expected in \
 done
 
 for expected in \
+  '_bwfile_save /secret path --name example' \
+  '_bwfile_load example' \
+  '_bwfile_list --search example' \
+  '_bwfile_show example' \
+  '_bwfile_status' \
+  '_bwfile_remove example --force'; do
+  [[ "$calls" == *"$expected"* ]] || fail "missing bwfile dispatch: $expected"
+done
+
+for expected in \
   '_bwssh_import /key path --name example' \
   '_bwssh_load example --ttl 10h' \
   '_bwssh_unload example' \
@@ -104,6 +126,7 @@ for old_alias in bwul bwst bwpw bwus bwno bwg bwlc bwnc bwexp bwsync; do
 done
 
 [[ "${_comps[bwenv]}" == _bwenv ]] || fail 'bwenv completion is not registered'
+[[ "${_comps[bwfile]}" == _bwfile ]] || fail 'bwfile completion is not registered'
 [[ "${_comps[bwvault]}" == _bwvault ]] || fail 'bwvault completion is not registered'
 [[ "${_comps[bwitem]}" == _bwitem ]] || fail 'bwitem completion is not registered'
 [[ "${_comps[bwnote]}" == _bwnote ]] || fail 'bwnote completion is not registered'
@@ -113,7 +136,7 @@ ROOT="$ROOT" zsh -f -c '
   source "$ROOT/zsh-bitwarden.plugin.zsh"
   autoload -Uz compinit
   compinit -D
-  [[ ${_comps[bwenv]} == _bwenv && ${_comps[bwvault]} == _bwvault &&
+  [[ ${_comps[bwenv]} == _bwenv && ${_comps[bwfile]} == _bwfile && ${_comps[bwvault]} == _bwvault &&
      ${_comps[bwitem]} == _bwitem && ${_comps[bwnote]} == _bwnote &&
      ${_comps[bwssh]} == _bwssh ]]
 ' || fail 'completion failed when the plugin loaded before compinit'

@@ -1,0 +1,48 @@
+#compdef bwfile
+
+local -a commands
+commands=(
+  'save:store a textual local secret file in Bitwarden'
+  'load:restore one or more managed secret files'
+  'list:list non-secret bwfile metadata'
+  'show:show metadata and local state without content'
+  'status:compare local files with vault content'
+  'remove:remove the Bitwarden item but not the local file'
+  'help:show bwfile help'
+)
+
+if (( CURRENT == 2 )); then
+  _describe 'bwfile command' commands
+  return
+fi
+
+case "${words[2]}" in
+  save)
+    _arguments \
+      '(-n --name)'{-n,--name}'[logical name]:logical name:' \
+      '--lifecycle[file lifecycle]:lifecycle:(provision recovery)' \
+      '--mode[safe four-digit octal mode]:mode:(0600 0400 0640 0440)' \
+      '--description[non-secret description]:description:' \
+      '(- 1 *)'{--force,--update}'[update an existing item]' \
+      '1:secret file:_files'
+    ;;
+  load)
+    _arguments \
+      '--force[replace a differing local file]' \
+      '--all[restore all provision items]' \
+      '--lifecycle[restore an explicit lifecycle]:lifecycle:(provision recovery)' \
+      '1:logical name:'
+    ;;
+  list)
+    _arguments '(-s --search)'{-s,--search}'[filter logical names]:text:'
+    ;;
+  show)
+    _arguments '1:logical name:'
+    ;;
+  remove)
+    _arguments '--force[skip removal confirmation]' '1:logical name:'
+    ;;
+  help)
+    _values 'bwfile command' save load list show status remove
+    ;;
+esac

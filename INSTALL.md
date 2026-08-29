@@ -36,7 +36,7 @@ plugins=(... zsh-bitwarden)
 
 ## Optional integrations
 
-`bwnote yaml` requires `yq`.
+`bwnote yaml` and all `bwfile` commands require Mike Farah `yq` v4.
 
 `bwssh` requires the operating system's OpenSSH `ssh-add` and `ssh-keygen` commands. A native agent must already be running and reachable through `SSH_AUTH_SOCK`; the plugin does not start or configure one. These commands are available from standard OpenSSH packages on macOS, Linux, and Android/Termux.
 
@@ -53,5 +53,6 @@ Reload Zsh and verify the installation:
 ```zsh
 bwdoctor
 bwenv doctor
+bwfile help
 bwssh status
 ```

@@ -1684,6 +1684,506 @@ bwenv() {
 }
 
 # -------------------------------------------------------------------
+# Bitwarden-backed persistent secret files
+# -------------------------------------------------------------------
+
+BWFILE_PREFIX="${BWFILE_PREFIX:-BWFILE_}"
+
+_bwfile_require() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    print -u2 "bwfile requires '$1'."
+    return 1
+  fi
+}
+
+_bwfile_require_tools() {
+  _bwfile_require bw && _bwfile_require jq && _bwfile_require yq && _bwfile_require mktemp
+}
+
+_bwfile_normalize_name() {
+  local name="${1#$BWFILE_PREFIX}"
+  name="${(U)name}"
+  name="${name//[^A-Z0-9]/_}"
+  while [[ "$name" == *__* ]]; do name="${name//__/_}"; done
+  name="${name##_}"
+  name="${name%%_}"
+  print -r -- "$name"
+}
+
+_bwfile_item_name() {
+  local name="$(_bwfile_normalize_name "$1")"
+  [[ -n "$name" ]] || return 1
+  print -r -- "${BWFILE_PREFIX}${name}"
+}
+
+_bwfile_valid_mode() {
+  [[ "$1" =~ '^0[0-7]{3}$' ]] || return 1
+  (( (8#$1 & 8#0137) == 0 ))
+}
+
+_bwfile_file_mode() {
+  local mode
+  mode="$(stat -c '%a' -- "$1" 2>/dev/null)" || \
+    mode="$(stat -f '%Lp' -- "$1" 2>/dev/null)" || return 1
+  [[ "$mode" =~ '^[0-7]{3,4}$' ]] || return 1
+  printf '0%03o' "$(( 8#$mode ))"
+}
+
+_bwfile_parse_metadata() {
+  local item_name="$1" notes="$2" metadata version
+  metadata="$(print -rn -- "$notes" | yq eval -o=json '.' - 2>/dev/null)" || return 2
+  version="$(print -rn -- "$metadata" | jq -er '.version | select(type == "number")' 2>/dev/null)" || return 2
+  [[ "$version" == 1 ]] || return 3
+  REPLY="$(print -rn -- "$metadata" | jq -cer --arg name "$item_name" '
+    def safe_string:
+      type == "string" and (test("[\u0000-\u001f\u007f]") | not);
+    select(type == "object")
+    | select((keys - ["description", "lifecycle", "mode", "path", "version"]) | length == 0)
+    | select(.version == 1)
+    | select(.path | safe_string and length > 0)
+    | select(.mode | safe_string and test("^0[0-7]{3}$"))
+    | select(.lifecycle == "provision" or .lifecycle == "recovery")
+    | select((has("description") | not) or (.description | safe_string))
+    | {name: $name, version, path, mode, lifecycle, description: (.description // "")}
+  ' 2>/dev/null)" || return 2
+  _bwfile_valid_mode "$(print -rn -- "$REPLY" | jq -r '.mode')" || return 4
+}
+
+_bwfile_metadata_yaml() {
+  local configured_path="$1" mode="$2" lifecycle="$3" description="$4"
+  jq -cn --arg path "$configured_path" --arg mode "$mode" --arg lifecycle "$lifecycle" \
+    --arg description "$description" '
+      {version: 1, path: $path, mode: $mode, lifecycle: $lifecycle}
+      + (if $description == "" then {} else {description: $description} end)
+    ' | yq eval -P '.' -
+}
+
+_bwfile_resolve_path() {
+  local configured="$1" expanded component current
+  [[ -n "$configured" && "$configured" != / ]] || return 1
+  if [[ "$configured" == '~' ]]; then
+    return 1
+  elif [[ "$configured" == '~/'* ]]; then
+    expanded="$HOME/${configured#\~/}"
+  elif [[ "$configured" == /* ]]; then
+    expanded="$configured"
+  else
+    return 1
+  fi
+  expanded="${expanded:a}"
+  [[ "$expanded" != / ]] || return 1
+  current=""
+  for component in "${(@s:/:)expanded}"; do
+    [[ -n "$component" ]] || continue
+    current="$current/$component"
+    [[ ! -L "$current" ]] || return 2
+  done
+  REPLY="$expanded"
+}
+
+_bwfile_text_file() {
+  jq -eRs 'index("\u0000") == null' "$1" >/dev/null 2>&1 || return 1
+  cmp -s -- "$1" <(jq -jRs '.' "$1" 2>/dev/null)
+}
+
+_bwfile_inventory() {
+  local session="$1" items encoded id name notes parse_status metadata
+  setopt localoptions pipefail
+  items="$(
+    BW_SESSION="$session" bw list items 2>/dev/null \
+      | jq -cr --arg prefix "$BWFILE_PREFIX" \
+          '.[] | select(.type == 2 and (.name | startswith($prefix))) | {id, name, notes} | @json | @base64'
+  )" || {
+    print -u2 'Unable to list bwfile items from the current vault data.'
+    return 1
+  }
+  [[ -n "$items" ]] || return 0
+  while IFS= read -r encoded; do
+    id="$(print -rn -- "$encoded" | jq -Rr '@base64d | fromjson | .id')" || continue
+    name="$(print -rn -- "$encoded" | jq -Rr '@base64d | fromjson | .name | gsub("[\u0000-\u001f\u007f]"; "?")')" || continue
+    notes="$(print -rn -- "$encoded" | jq -Rr '@base64d | fromjson | .notes // ""')" || continue
+    _bwfile_parse_metadata "$name" "$notes"
+    parse_status=$?
+    if (( parse_status == 0 )); then
+      print -rn -- "$REPLY" | jq -c --arg id "$id" '. + {id: $id, valid: true}'
+    else
+      case "$parse_status" in
+        3) metadata='unsupported metadata version' ;;
+        4) metadata='unsafe mode' ;;
+        *) metadata='invalid metadata' ;;
+      esac
+      jq -cn --arg id "$id" --arg name "$name" --arg error "$metadata" \
+        '{id: $id, name: $name, valid: false, error: $error}'
+    fi
+  done <<< "$items"
+}
+
+_bwfile_find() {
+  local session="$1" requested="$2" item_name inventory count
+  item_name="$(_bwfile_item_name "$requested")" || {
+    print -u2 'Invalid bwfile logical name.'
+    return 1
+  }
+  inventory="$(_bwfile_inventory "$session")" || return 1
+  count="$(print -rn -- "$inventory" | jq -s --arg name "$item_name" '[.[] | select(.name == $name)] | length')" || return 1
+  [[ "$count" == 1 ]] || {
+    print -u2 "Unable to find a unique Bitwarden item named '$item_name'."
+    print -u2 "Run 'bwvault sync' and retry if the item changed recently."
+    return 1
+  }
+  REPLY="$(print -rn -- "$inventory" | jq -cs --arg name "$item_name" '.[] | select(.name == $name)')"
+}
+
+_bwfile_content_stream() {
+  local session="$1" id="$2"
+  setopt localoptions pipefail
+  BW_SESSION="$session" bw get item "$id" 2>/dev/null | jq -je '
+    [.fields[]? | select(.name == "content" and .type == 1 and (.value | type == "string"))]
+    | if length == 1 then .[0].value else error("missing or ambiguous content field") end
+  '
+}
+
+_bwfile_content_matches() {
+  local session="$1" id="$2" destination="$3"
+  local -a stages
+  setopt localoptions pipefail
+  _bwfile_content_stream "$session" "$id" | cmp -s -- "$destination" -
+  stages=(${pipestatus[@]})
+  (( stages[1] == 0 )) || return 2
+  (( stages[2] == 0 ))
+}
+
+_bwfile_save() {
+  _bwfile_require_tools || return 1
+  local source="" logical_name="" lifecycle=provision mode="" description="" force=0
+  while (( $# > 0 )); do
+    case "$1" in
+      -n|--name) (( $# >= 2 )) || { print -u2 "Missing value for $1."; return 2; }; logical_name="$2"; shift 2 ;;
+      --lifecycle) (( $# >= 2 )) || { print -u2 'Missing value for --lifecycle.'; return 2; }; lifecycle="$2"; shift 2 ;;
+      --mode) (( $# >= 2 )) || { print -u2 'Missing value for --mode.'; return 2; }; mode="$2"; shift 2 ;;
+      --description) (( $# >= 2 )) || { print -u2 'Missing value for --description.'; return 2; }; description="$2"; shift 2 ;;
+      --force|--update) force=1; shift ;;
+      --) shift ;;
+      -*) print -u2 "Unknown bwfile save option: $1"; return 2 ;;
+      *) [[ -z "$source" ]] || { print -u2 'bwfile save accepts exactly one path.'; return 2; }; source="$1"; shift ;;
+    esac
+  done
+  [[ -n "$source" ]] || { print -u2 'Usage: bwfile save PATH [--name NAME] [--lifecycle provision|recovery] [--mode MODE] [--description TEXT] [--force]'; return 2; }
+  [[ ! -L "$source" ]] || { print -u2 "Refusing symlink source: $source"; return 1; }
+  [[ -f "$source" && -r "$source" ]] || { print -u2 "Source is not a readable regular file: $source"; return 1; }
+  _bwfile_text_file "$source" || { print -u2 'bwfile v1 accepts only textual files without NUL bytes or invalid text encoding.'; return 1; }
+  [[ "$lifecycle" == provision || "$lifecycle" == recovery ]] || { print -u2 "Invalid lifecycle: $lifecycle"; return 2; }
+  [[ -n "$mode" ]] || mode="$(_bwfile_file_mode "$source")" || { print -u2 'Unable to determine source permissions.'; return 1; }
+  [[ "$mode" == 0* ]] || mode="0$mode"
+  _bwfile_valid_mode "$mode" || { print -u2 "Unsafe mode '$mode': only owner read/write and optional group read are allowed."; return 1; }
+
+  local absolute configured item_name metadata session matches count id result
+  absolute="${source:a}"
+  configured="$absolute"
+  [[ "$absolute" == "$HOME"/* ]] && configured="~/${absolute#$HOME/}"
+  [[ -n "$logical_name" ]] || logical_name="${source:t}"
+  logical_name="$(_bwfile_normalize_name "$logical_name")"
+  item_name="$(_bwfile_item_name "$logical_name")" || { print -u2 'Invalid bwfile logical name.'; return 2; }
+  metadata="$(_bwfile_metadata_yaml "$configured" "$mode" "$lifecycle" "$description")" || { print -u2 'Unable to create bwfile metadata.'; return 1; }
+  _bwfile_parse_metadata "$item_name" "$metadata" || {
+    print -u2 'Path or description contains unsupported metadata characters.'
+    return 1
+  }
+  session="$(_bw_session)" || { print -u2 'Unable to unlock the Bitwarden CLI vault.'; return 1; }
+  matches="$(BW_SESSION="$session" bw list items 2>/dev/null | jq -c --arg name "$item_name" '[.[] | select(.name == $name) | {id, name}]')" || { print -u2 'Unable to inspect existing Bitwarden items.'; return 1; }
+  count="$(print -rn -- "$matches" | jq 'length')"
+  (( count <= 1 )) || { print -u2 "Multiple Bitwarden items are named '$item_name'; resolve the ambiguity first."; return 1; }
+  if (( count == 1 && ! force )); then
+    print -u2 "Bitwarden item '$item_name' already exists. Use --force to update it."
+    return 1
+  fi
+
+  setopt localoptions pipefail
+  if (( count == 1 )); then
+    id="$(print -rn -- "$matches" | jq -r '.[0].id')"
+    if ! BW_SESSION="$session" bw get item "$id" 2>/dev/null \
+      | jq -c --arg name "$item_name" --arg notes "$metadata" --rawfile content "$source" '
+          .name = $name | .type = 2 | .secureNote = {type: 0} | .notes = $notes
+          | .fields = ([.fields[]? | select(.name != "content")] + [{name:"content", value:$content, type:1}])
+          | del(.login, .card, .identity, .sshKey)
+        ' | bw encode | BW_SESSION="$session" bw edit item "$id" >/dev/null 2>&1; then
+      print -u2 "Unable to update Bitwarden item '$item_name'."
+      return 1
+    fi
+  else
+    if ! BW_SESSION="$session" bw get template item 2>/dev/null \
+      | jq -c --arg name "$item_name" --arg notes "$metadata" --rawfile content "$source" '
+          .name = $name | .type = 2 | .secureNote = {type: 0} | .notes = $notes
+          | .fields = [{name:"content", value:$content, type:1}]
+          | del(.login, .card, .identity, .sshKey)
+        ' | bw encode | BW_SESSION="$session" bw create item >/dev/null 2>&1; then
+      print -u2 "Unable to create Bitwarden item '$item_name'."
+      return 1
+    fi
+  fi
+  print "Saved $item_name"
+  print "Path: $configured"
+  print "Mode: $mode"
+  print "Lifecycle: $lifecycle"
+  _bw_mutation_notice
+}
+
+_bwfile_materialize() {
+  local session="$1" record="$2" force="$3" name id configured mode lifecycle destination parent temporary stages existed=0
+  name="$(print -rn -- "$record" | jq -r '.name')"
+  id="$(print -rn -- "$record" | jq -r '.id')"
+  configured="$(print -rn -- "$record" | jq -r '.path')"
+  mode="$(print -rn -- "$record" | jq -r '.mode')"
+  lifecycle="$(print -rn -- "$record" | jq -r '.lifecycle')"
+  if [[ "$(print -rn -- "$record" | jq -r '.valid')" != true ]]; then
+    print -u2 "Invalid metadata: $name ($(print -rn -- "$record" | jq -r '.error'))"
+    return 1
+  fi
+  _bwfile_valid_mode "$mode" || { print -u2 "Invalid or unsafe mode for $name."; return 1; }
+  _bwfile_resolve_path "$configured"
+  case $? in
+    0) destination="$REPLY" ;;
+    2) print -u2 "Refusing path with a symlink component for $name: $configured"; return 1 ;;
+    *) print -u2 "Invalid destination path for $name: $configured"; return 1 ;;
+  esac
+  [[ ! -d "$destination" ]] || { print -u2 "Destination is a directory for $name: $configured"; return 1; }
+  [[ ! -L "$destination" ]] || { print -u2 "Refusing symlink destination for $name: $configured"; return 1; }
+
+  if [[ -e "$destination" ]]; then
+    existed=1
+    _bwfile_content_matches "$session" "$id" "$destination"
+    local comparison=$?
+    if (( comparison == 0 )); then
+      local current_mode
+      current_mode="$(_bwfile_file_mode "$destination")" || { print -u2 "Unable to read permissions for $name."; return 1; }
+      if [[ "$current_mode" != "$mode" ]]; then
+        chmod "$mode" -- "$destination" 2>/dev/null || { print -u2 "Unable to correct permissions for $name."; return 1; }
+        print "Corrected mode: ${name#$BWFILE_PREFIX}  $configured  $mode"
+      else
+        print "Up to date: ${name#$BWFILE_PREFIX}  $configured"
+      fi
+      return 0
+    elif (( comparison == 2 )); then
+      print -u2 "Unable to retrieve content for $name."
+      return 1
+    elif (( ! force )); then
+      print -u2 "Local file differs for ${name#$BWFILE_PREFIX}: $configured (use --force to replace it)"
+      return 1
+    fi
+  fi
+
+  parent="${destination:h}"
+  ( umask 077; mkdir -p -- "$parent" ) 2>/dev/null || { print -u2 "Unable to create destination directory for $name."; return 1; }
+  _bwfile_resolve_path "$configured" || { print -u2 "Destination became unsafe for $name."; return 1; }
+  temporary="$(umask 077; mktemp "$parent/.bwfile.XXXXXXXX")" || { print -u2 "Unable to create a secure temporary file for $name."; return 1; }
+  chmod 600 -- "$temporary" 2>/dev/null || { rm -f -- "$temporary"; print -u2 "Unable to secure temporary file for $name."; return 1; }
+  setopt localoptions pipefail
+  _bwfile_content_stream "$session" "$id" >| "$temporary"
+  stages=(${pipestatus[@]})
+  if ! _bw_pipefail "${stages[@]}"; then
+    rm -f -- "$temporary"
+    print -u2 "Unable to retrieve content for $name."
+    return 1
+  fi
+  chmod "$mode" -- "$temporary" 2>/dev/null || { rm -f -- "$temporary"; print -u2 "Unable to apply mode for $name."; return 1; }
+  [[ ! -d "$destination" && ! -L "$destination" ]] || { rm -f -- "$temporary"; print -u2 "Destination became unsafe for $name."; return 1; }
+  if (( ! force && ! existed )) && [[ -e "$destination" ]]; then
+    rm -f -- "$temporary"
+    print -u2 "Destination appeared during restore for $name; refusing to overwrite it."
+    return 1
+  fi
+  mv -f -- "$temporary" "$destination" 2>/dev/null || { rm -f -- "$temporary"; print -u2 "Unable to atomically install $name."; return 1; }
+  print "Loaded: ${name#$BWFILE_PREFIX}  $configured  $mode  $lifecycle"
+}
+
+_bwfile_load() {
+  _bwfile_require_tools || return 1
+  local force=0 all=0 lifecycle="" requested=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --force) force=1; shift ;;
+      --all) all=1; shift ;;
+      --lifecycle) (( $# >= 2 )) || { print -u2 'Missing value for --lifecycle.'; return 2; }; lifecycle="$2"; shift 2 ;;
+      --) shift ;;
+      -*) print -u2 "Unknown bwfile load option: $1"; return 2 ;;
+      *) [[ -z "$requested" ]] || { print -u2 'bwfile load accepts one name or a bulk option.'; return 2; }; requested="$1"; shift ;;
+    esac
+  done
+  (( all + (${#lifecycle} > 0) + (${#requested} > 0) == 1 )) || { print -u2 'Usage: bwfile load NAME [--force] | --all [--force] | --lifecycle provision|recovery [--force]'; return 2; }
+  [[ -z "$lifecycle" || "$lifecycle" == provision || "$lifecycle" == recovery ]] || { print -u2 "Invalid lifecycle: $lifecycle"; return 2; }
+  (( all )) && lifecycle=provision
+  local session inventory record failed=0 succeeded=0 skipped=0
+  session="$(_bw_session)" || { print -u2 'Unable to unlock the Bitwarden CLI vault.'; return 1; }
+  if [[ -n "$requested" ]]; then
+    _bwfile_find "$session" "$requested" || return 1
+    inventory="$REPLY"
+  else
+    inventory="$(_bwfile_inventory "$session")" || return 1
+    inventory="$(print -rn -- "$inventory" | jq -cs --arg lifecycle "$lifecycle" '.[] | select(.valid == false or .lifecycle == $lifecycle)')"
+  fi
+  [[ -n "$inventory" ]] || { print 'No matching bwfile items.'; return 0; }
+  while IFS= read -r record; do
+    if _bwfile_materialize "$session" "$record" "$force"; then (( ++succeeded )); else (( ++failed )); fi
+  done <<< "$inventory"
+  if [[ -z "$requested" ]]; then
+    print "Summary: $succeeded succeeded, $failed failed"
+  fi
+  (( failed == 0 ))
+}
+
+_bwfile_list() {
+  _bwfile_require_tools || return 1
+  local search="" session inventory record name lifecycle listed_path
+  while (( $# > 0 )); do
+    case "$1" in
+      -s|--search) (( $# >= 2 )) || { print -u2 "Missing value for $1."; return 2; }; search="$2"; shift 2 ;;
+      *) print -u2 'Usage: bwfile list [--search TEXT]'; return 2 ;;
+    esac
+  done
+  session="$(_bw_session)" || return 1
+  inventory="$(_bwfile_inventory "$session")" || return 1
+  print -r -- $'NAME\tLIFECYCLE\tPATH'
+  [[ -n "$inventory" ]] || return 0
+  while IFS= read -r record; do
+    name="$(print -rn -- "$record" | jq -r '.name')"
+    [[ -z "$search" || "${(L)name}" == *"${(L)search}"* ]] || continue
+    if [[ "$(print -rn -- "$record" | jq -r '.valid')" == true ]]; then
+      lifecycle="$(print -rn -- "$record" | jq -r '.lifecycle')"
+      listed_path="$(print -rn -- "$record" | jq -r '.path')"
+    else
+      lifecycle='invalid'
+      listed_path="$(print -rn -- "$record" | jq -r '.error')"
+    fi
+    print -r -- "${name#$BWFILE_PREFIX}"$'\t'"$lifecycle"$'\t'"$listed_path"
+  done <<< "$inventory" | column -t -s $'\t'
+}
+
+_bwfile_local_state() {
+  local session="$1" record="$2" name id configured mode destination current_mode
+  name="$(print -rn -- "$record" | jq -r '.name')"
+  id="$(print -rn -- "$record" | jq -r '.id')"
+  configured="$(print -rn -- "$record" | jq -r '.path')"
+  mode="$(print -rn -- "$record" | jq -r '.mode')"
+  _bwfile_resolve_path "$configured" || { REPLY='unsafe path'; return 1; }
+  destination="$REPLY"
+  [[ ! -d "$destination" && ! -L "$destination" ]] || { REPLY='unsafe destination'; return 1; }
+  [[ -e "$destination" ]] || { REPLY='missing'; return 0; }
+  [[ -r "$destination" ]] || { REPLY='inaccessible'; return 1; }
+  _bwfile_content_matches "$session" "$id" "$destination"
+  case $? in
+    0) ;;
+    1) REPLY='content differs'; return 0 ;;
+    *) REPLY='vault content unavailable'; return 1 ;;
+  esac
+  current_mode="$(_bwfile_file_mode "$destination")" || { REPLY='inaccessible'; return 1; }
+  [[ "$current_mode" == "$mode" ]] && REPLY='present and matches' || REPLY="wrong permissions ($current_mode, expected $mode)"
+}
+
+_bwfile_show() {
+  _bwfile_require_tools || return 1
+  (( $# == 1 )) || { print -u2 'Usage: bwfile show NAME'; return 2; }
+  local session record state
+  session="$(_bw_session)" || return 1
+  _bwfile_find "$session" "$1" || return 1
+  record="$REPLY"
+  [[ "$(print -rn -- "$record" | jq -r '.valid')" == true ]] || { print -u2 "Invalid metadata: $(print -rn -- "$record" | jq -r '.error')"; return 1; }
+  _bwfile_local_state "$session" "$record"; state="$REPLY"
+  print "Name: $(print -rn -- "$record" | jq -r '.name')"
+  print "Version: $(print -rn -- "$record" | jq -r '.version')"
+  print "Path: $(print -rn -- "$record" | jq -r '.path')"
+  print "Mode: $(print -rn -- "$record" | jq -r '.mode')"
+  print "Lifecycle: $(print -rn -- "$record" | jq -r '.lifecycle')"
+  [[ -z "$(print -rn -- "$record" | jq -r '.description')" ]] || print "Description: $(print -rn -- "$record" | jq -r '.description')"
+  print "Local state: $state"
+}
+
+_bwfile_status() {
+  _bwfile_require_tools || return 1
+  (( $# == 0 )) || { print -u2 'Usage: bwfile status'; return 2; }
+  local session inventory record name state failed=0
+  session="$(_bw_session)" || return 1
+  inventory="$(_bwfile_inventory "$session")" || return 1
+  [[ -n "$inventory" ]] || { print 'No bwfile items.'; return 0; }
+  while IFS= read -r record; do
+    name="$(print -rn -- "$record" | jq -r '.name')"
+    if [[ "$(print -rn -- "$record" | jq -r '.valid')" != true ]]; then
+      print "! ${name#$BWFILE_PREFIX}: $(print -rn -- "$record" | jq -r '.error')"
+      (( ++failed )); continue
+    fi
+    _bwfile_local_state "$session" "$record"; state="$REPLY"
+    [[ "$state" == 'present and matches' ]] || (( ++failed ))
+    if [[ "$(print -rn -- "$record" | jq -r '.lifecycle')" == recovery ]]; then
+      print "${name#$BWFILE_PREFIX}: recovery-only; $state"
+    else
+      print "${name#$BWFILE_PREFIX}: $state"
+    fi
+    print "  $(print -rn -- "$record" | jq -r '.path')  $(print -rn -- "$record" | jq -r '.mode')  $(print -rn -- "$record" | jq -r '.lifecycle')"
+  done <<< "$inventory"
+  (( failed == 0 ))
+}
+
+_bwfile_remove() {
+  _bwfile_require_tools || return 1
+  local force=0 requested=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --force) force=1; shift ;;
+      -*) print -u2 "Unknown bwfile remove option: $1"; return 2 ;;
+      *) [[ -z "$requested" ]] || { print -u2 'Usage: bwfile remove NAME [--force]'; return 2; }; requested="$1"; shift ;;
+    esac
+  done
+  [[ -n "$requested" ]] || { print -u2 'Usage: bwfile remove NAME [--force]'; return 2; }
+  local session record name id answer
+  session="$(_bw_session)" || return 1
+  _bwfile_find "$session" "$requested" || return 1
+  record="$REPLY" name="$(print -rn -- "$record" | jq -r '.name')" id="$(print -rn -- "$record" | jq -r '.id')"
+  if (( ! force )); then
+    [[ -t 0 ]] || { print -u2 'Confirmation requires a terminal; use --force after verifying the item name.'; return 1; }
+    print -n "Remove Bitwarden item '$name'? [y/N] "
+    read -r answer
+    [[ "$answer" == [yY] || "$answer" == [yY][eE][sS] ]] || { print 'Cancelled.'; return 1; }
+  fi
+  BW_SESSION="$session" bw delete item "$id" >/dev/null 2>&1 || { print -u2 "Unable to remove Bitwarden item '$name'."; return 1; }
+  print "Removed Bitwarden item: $name"
+  print 'The local file was not deleted.'
+  _bw_mutation_notice
+}
+
+_bwfile_help() {
+  print -r -- 'Usage: bwfile <command> [arguments]
+
+Commands:
+  save PATH              store a textual local file in a hidden content field
+  load NAME              securely restore one managed file
+  load --all             restore provision items only
+  load --lifecycle TYPE  restore provision or recovery items explicitly
+  list                    list logical names and non-secret metadata
+  show NAME               show metadata and local state, never content
+  status                  compare managed files with vault content
+  remove NAME             remove only the Bitwarden item after confirmation
+  help                    show this help
+
+Reads never sync automatically. Recovery items are never included by --all.
+Paths must be absolute or begin with ~/; symlink destinations are refused.
+Version 1 supports textual files only and owner read/write with optional group read.'
+}
+
+bwfile() {
+  local command_name="${1:-help}"
+  (( $# > 0 )) && shift
+  case "$command_name" in
+    save) _bwfile_save "$@" ;;
+    load) _bwfile_load "$@" ;;
+    list) _bwfile_list "$@" ;;
+    show) _bwfile_show "$@" ;;
+    status) _bwfile_status "$@" ;;
+    remove) _bwfile_remove "$@" ;;
+    help|-h|--help) _bwfile_help ;;
+    *) print -u2 "Unknown bwfile command: $command_name"; print -u2 "Run 'bwfile help' to see available commands."; return 2 ;;
+  esac
+}
+
+# -------------------------------------------------------------------
 # Bitwarden SSH keys and the native OpenSSH agent
 # -------------------------------------------------------------------
 
@@ -2403,7 +2903,7 @@ bwdoctor() {
   done
   _bwdoctor_clipboard || (( ++failed ))
 
-  command -v yq >/dev/null 2>&1 && print 'optional: yq available' || print 'optional: yq missing (required only for bwnote yaml)'
+  command -v yq >/dev/null 2>&1 && print 'optional: yq available' || print 'optional: yq missing (required for bwnote yaml and bwfile)'
   command -v ssh-add >/dev/null 2>&1 && print 'optional: ssh-add available' || print 'optional: ssh-add missing (required only for bwssh)'
   command -v ssh-keygen >/dev/null 2>&1 && print 'optional: ssh-keygen available' || print 'optional: ssh-keygen missing (required only for bwssh import)'
   if [[ -x "$BWENV_KEYRING_BIN" ]] && BWENV_KEYRING_SERVICE="$BWENV_KEYRING_SERVICE" "$BWENV_KEYRING_BIN" status >/dev/null 2>&1; then

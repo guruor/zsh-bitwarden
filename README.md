@@ -1,6 +1,6 @@
 # zsh-bitwarden
 
-Interactive Zsh workflows on top of the official [Bitwarden CLI](https://github.com/bitwarden/clients/tree/main/apps/cli). The plugin keeps `bw` available for complete CLI access and adds `fzf` selection, structured-note editing, environment-secret loading, native SSH-agent key loading, and shell completion.
+Interactive Zsh workflows on top of the official [Bitwarden CLI](https://github.com/bitwarden/clients/tree/main/apps/cli). The plugin keeps `bw` available for complete CLI access and adds `fzf` selection, structured-note editing, environment-secret loading, secure-file provisioning, native SSH-agent key loading, and shell completion.
 
 ## Install
 
@@ -31,6 +31,7 @@ bwvault help
 bwitem help
 bwnote help
 bwenv help
+bwfile help
 bwssh help
 ```
 
@@ -103,6 +104,108 @@ bwenv remove OPENAI_API_KEY
 Set `BW_ENV_SECRETS="OPENAI_API_KEY GITHUB_TOKEN"` for default names. Without arguments or defaults, `export` and `store` use safe `fzf --multi` selection; only item names and source types reach `fzf`, never decrypted values.
 
 Keyring storage is intentionally limited to explicit environment values. Caching complete Bitwarden items would duplicate structured decrypted vault data and create stale copies. `bwenv store/load/remove` use Python [`keyring`](https://pypi.org/project/keyring/) for macOS Keychain, Linux Secret Service/KWallet, or Windows Credential Manager; see [INSTALL.md](INSTALL.md).
+
+### Secret files
+
+`bwfile` manages durable machine-local textual secret files. Each secure-note item is named `BWFILE_<LOGICAL_NAME>`, has YAML lifecycle metadata in its note, and keeps the exact file payload separately in a hidden custom field named `content`:
+
+```yaml
+version: 1
+path: ~/.aws/credentials
+mode: "0600"
+lifecycle: provision
+description: AWS credentials for external workloads
+```
+
+Normal commands use the logical name without `BWFILE_`:
+
+```zsh
+bwfile save ~/.aws/credentials \
+  --name AWS_CREDENTIALS \
+  --lifecycle provision \
+  --description "AWS credentials"
+
+bwfile list
+bwfile show AWS_CREDENTIALS
+bwfile status
+bwfile load AWS_CREDENTIALS
+```
+
+Names are normalized to uppercase underscore form. `save` infers a name from the basename when `--name` is omitted, captures the current mode unless `--mode` is supplied, and never deletes the source. An existing item is not changed unless `--force` (or its `--update` alias) is supplied; updates preserve the item ID.
+
+`provision` files normally belong on a configured machine, such as `~/.aws/credentials`, `~/.config/sops/age/keys.txt`, or an application secret config. `recovery` files contain exceptional or disaster-recovery material. Bulk provisioning is explicit and idempotent:
+
+```zsh
+# --all intentionally means all provision items, never recovery items.
+bwfile load --all
+bwfile load --lifecycle provision
+
+# Recovery requires an explicit lifecycle request or individual name.
+bwfile load --lifecycle recovery
+```
+
+Loads create missing parent directories with a restrictive umask, stream content into a mode-`0600` temporary file in the destination directory, apply the configured mode, and atomically rename it. Existing identical files are not rewritten; mode drift is corrected. Different content, directories, symlink destinations, and paths with existing symlink components are refused unless the only issue is differing content and `--force` is given. Paths must be absolute or start with `~/`; `$VAR`, command substitutions, backticks, globs, and other shell syntax are never expanded or executed.
+
+Version 1 is textual only. It accepts empty and multiline text while preserving trailing-newline semantics, but rejects NUL bytes or content that cannot round-trip through `jq` without changing bytes. Binary files are not automatically base64-encoded. Modes must be four-digit octal strings and may grant only owner read/write plus optional group read; examples include `0600`, `0400`, and `0640`. Owner/group execute, group write, and every other-user permission are rejected because these persistent files contain high-sensitivity material. `bwfile` requires Mike Farah `yq` v4 to parse metadata safely.
+
+`bwfile remove NAME` moves only the Bitwarden item to trash after terminal confirmation. `--force` skips confirmation for deliberate automation. The materialized local file is never removed by that command.
+
+#### Examples
+
+SOPS continues to use its normal file-based age identity handling; `bwfile` adds no SOPS-specific behavior:
+
+```zsh
+bwfile save ~/.config/sops/age/keys.txt \
+  --name SOPS_AGE_KEY \
+  --lifecycle provision
+
+# On a new machine:
+bwfile load SOPS_AGE_KEY
+# Result: ~/.config/sops/age/keys.txt, mode 0600
+```
+
+AWS credential content is likewise opaque to the plugin:
+
+```zsh
+bwfile save ~/.aws/credentials \
+  --name AWS_CREDENTIALS \
+  --lifecycle provision
+
+bwfile load AWS_CREDENTIALS
+aws sts get-caller-identity
+```
+
+GnuPG owns the structure and permissions inside `~/.gnupg`; `bwfile` does not manage that directory or import keys. It can store an exported textual GPG backup as one file, but importing the backup remains a separate GnuPG operation.
+
+#### Dotfiles and lifecycle
+
+Keep public configuration, `bwfile` tooling, and installation orchestration in dotfiles; keep durable secret-file sources in Bitwarden; keep restored copies only as local machine state. A dotfiles installer may call `bwfile load --lifecycle provision`, but this plugin has no dependency on a dotfiles layout.
+
+One possible new-machine sequence is:
+
+```zsh
+# install dotfiles and the configured Bitwarden CLI first
+bwvault unlock
+bwfile load --lifecycle provision
+bwssh load
+# load required bwenv values according to their own runtime lifecycle
+```
+
+Persistent `bwfile` files do not need restoration after every reboot. `bwssh` identities and `bwenv` values are runtime/session mechanisms and may need activation again when their agent, keyring, or shell lifecycle requires it.
+
+#### Secret-file migration
+
+1. Keep the existing tracked or synchronized secret file in place initially.
+2. Run `bwfile save PATH --name NAME`.
+3. Verify its non-secret metadata with `bwfile show NAME`.
+4. Manually remove or move the tracked/synchronized copy.
+5. Run `bwfile load NAME` into the intended machine-local path.
+6. Verify the consuming application.
+7. Add appropriate Git and synchronization exclusions.
+8. If the secret was committed, purge Git history separately where required.
+9. Rotate credentials or keys when prior exposure warrants it.
+
+Saving never deletes the source, edits Git history, or rotates credentials.
 
 ### SSH keys
 
@@ -181,6 +284,10 @@ Deleting a private key from the current working tree does not remove it from exi
 - No command synchronizes automatically.
 - Secrets sent to the keyring helper travel over stdin, not command arguments.
 - Completion never queries or unlocks the vault.
+- `bwfile` completion contains only static commands/options; it never queries item names, metadata, or payloads.
+- `bwfile` sends create/edit JSON through stdin pipelines, never places raw payloads in `bw` command arguments, and does not use the `bwenv` keyring or another cache.
+- Secret-file content is streamed for comparison and restoration and is never printed. It necessarily passes through the memory and pipes of `bw`, `jq`, and Zsh.
+- Bitwarden is the source of truth for a managed secret file; the restored copy is local runtime/machine state.
 - Keyring loading does not contact Bitwarden or expose values in command output.
 - SSH private keys are streamed to `ssh-add` over stdin and are never stored in the OS keyring or plugin state.
 - Repository tests use fake `bw`, `fzf`, OpenSSH, and keyring executables and never access a real vault or user SSH key.

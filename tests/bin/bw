@@ -11,6 +11,45 @@ if [[ "$1" == --version ]]; then
     return 0
 fi
 
+if [[ -n "${BWFILE_TEST_MODE:-}" ]]; then
+    print -r -- "$*" >> "$BWFILE_TEST_LOG"
+    [[ "${BWFILE_FAIL_COMMAND:-}" == "$1" && "$1" != create && "$1" != edit ]] && return 1
+    case "$1 $2" in
+        'unlock --raw') print -r -- 'test-session' ;;
+        'list items') jq -c '.' "$BWFILE_TEST_STATE" ;;
+        'get item')
+            jq -cer --arg id "$3" '.[] | select(.id == $id or .name == $id)' "$BWFILE_TEST_STATE"
+            ;;
+        'get template')
+            print -r -- '{"type":1,"name":"","notes":null,"fields":[],"login":{},"secureNote":{},"card":{},"identity":{}}'
+            ;;
+        'encode ') command cat ;;
+        'create item')
+            [[ "${BWFILE_FAIL_COMMAND:-}" != create ]] || { print -u2 'fake create failure'; return 1; }
+            item="$(<&0)" || return 1
+            id="bwfile-$RANDOM-$RANDOM"
+            temp="$BWFILE_TEST_STATE.tmp"
+            jq --arg id "$id" --argjson item "$item" '. + [$item + {id:$id}]' "$BWFILE_TEST_STATE" > "$temp" && mv "$temp" "$BWFILE_TEST_STATE"
+            print -r -- "$item" | jq -c --arg id "$id" '. + {id:$id}'
+            ;;
+        'edit item')
+            [[ "${BWFILE_FAIL_COMMAND:-}" != edit ]] || { print -u2 'fake edit failure'; return 1; }
+            item="$(<&0)" || return 1
+            temp="$BWFILE_TEST_STATE.tmp"
+            jq --arg id "$3" --argjson item "$item" 'map(if .id == $id then $item + {id:$id} else . end)' "$BWFILE_TEST_STATE" > "$temp" && mv "$temp" "$BWFILE_TEST_STATE"
+            print -r -- "$item" | jq -c --arg id "$3" '. + {id:$id}'
+            ;;
+        'delete item')
+            [[ "${BWFILE_FAIL_COMMAND:-}" != delete ]] || { print -u2 'fake delete failure'; return 1; }
+            temp="$BWFILE_TEST_STATE.tmp"
+            jq --arg id "$3" 'map(select(.id != $id))' "$BWFILE_TEST_STATE" > "$temp" && mv "$temp" "$BWFILE_TEST_STATE"
+            print -r -- '{}'
+            ;;
+        *) print -u2 "Unexpected fake bwfile invocation: $*"; return 2 ;;
+    esac
+    return
+fi
+
 if [[ -n "${BWSSH_TEST_MODE:-}" ]]; then
     [[ "${BWSSH_FAIL_COMMAND:-}" == "$1" && "$1" != create ]] && return 1
     github_private='TEST_PRIVATE_GITHUB'
