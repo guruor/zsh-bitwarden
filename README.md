@@ -107,10 +107,10 @@ Keyring storage is intentionally limited to explicit environment values. Caching
 
 ### Secret files
 
-`bwfile` manages durable machine-local textual secret files. Each secure-note item is named `BWFILE_<LOGICAL_NAME>`, has YAML lifecycle metadata in its note, and keeps the exact file payload separately in a hidden custom field named `content`:
+`bwfile` manages durable machine-local textual secret files. Each secure-note item is named `BWFILE_<LOGICAL_NAME>` and has YAML lifecycle metadata in its note:
 
 ```yaml
-version: 1
+version: 2
 path: ~/.config/aws/credentials
 mode: "0600"
 lifecycle: provision
@@ -146,7 +146,9 @@ bwfile load --lifecycle recovery
 
 Loads create missing parent directories with a restrictive umask, stream content into a mode-`0600` temporary file in the destination directory, apply the configured mode, and atomically rename it. Existing identical files are not rewritten; mode drift is corrected. Different content, directories, symlink destinations, and paths with existing symlink components are refused unless the only issue is differing content and `--force` is given. Saving through a symlink does not weaken this restore-time protection: remove or deliberately replace the symlink before loading that item. Paths must be absolute or start with `~/`; `$VAR`, command substitutions, backticks, globs, and other shell syntax are never expanded or executed.
 
-Version 1 is textual only. It accepts empty and multiline text while preserving trailing-newline semantics, but rejects NUL bytes or content that cannot round-trip through `jq` without changing bytes. Binary files are not automatically base64-encoded. Modes must be four-digit octal strings and may grant only owner read/write plus optional group read; examples include `0600`, `0400`, and `0640`. Owner/group execute, group write, and every other-user permission are rejected because these persistent files contain high-sensitivity material. `bwfile` requires Mike Farah `yq` v4 to parse metadata safely.
+`bwfile` is textual only. It accepts empty and multiline text while preserving trailing-newline semantics, but rejects NUL bytes or content that cannot round-trip through `jq` without changing bytes. Binary files are not automatically base64-encoded. Modes must be four-digit octal strings and may grant only owner read/write plus optional group read; examples include `0600`, `0400`, and `0640`. Owner/group execute, group write, and every other-user permission are rejected because these persistent files contain high-sensitivity material. `bwfile` requires Mike Farah `yq` v4 to parse metadata safely.
+
+Version 2 splits exact textual payloads across ordered hidden fields named `content_0001`, `content_0002`, and so on. Each plaintext chunk is capped at 3,500 UTF-8 bytes, conservatively below Bitwarden's [5,000-character post-encryption custom-field limit](https://bitwarden.com/help/custom-fields/#custom-fields-for-keys). This preserves empty files, multiline Unicode text, and trailing-newline semantics without splitting a Unicode character. The names `content` and all names beginning with `content_` are reserved for this format. Other Bitwarden custom fields are ignored while reading content and preserved when an item is updated. Load and status reject malformed, oversized, duplicate, or non-contiguous reserved chunks before concatenating their values. A payload may use at most 9,999 chunks. Existing version 1 items with one hidden `content` field remain readable; updating one with `bwfile save --force` removes legacy/reserved content fields, preserves unrelated fields, and migrates the item to version 2.
 
 `bwfile remove NAME` moves only the Bitwarden item to trash after terminal confirmation. `--force` skips confirmation for deliberate automation. The materialized local file is never removed by that command.
 

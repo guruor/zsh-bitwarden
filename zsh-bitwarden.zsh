@@ -1688,6 +1688,7 @@ bwenv() {
 # -------------------------------------------------------------------
 
 BWFILE_PREFIX="${BWFILE_PREFIX:-BWFILE_}"
+BWFILE_CONTENT_CHUNK_BYTES=3500
 
 _bwfile_require() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -1739,13 +1740,13 @@ _bwfile_parse_metadata() {
   local item_name="$1" notes="$2" metadata version
   metadata="$(print -rn -- "$notes" | yq eval -o=json '.' - 2>/dev/null)" || return 2
   version="$(print -rn -- "$metadata" | jq -er '.version | select(type == "number")' 2>/dev/null)" || return 2
-  [[ "$version" == 1 ]] || return 3
+  [[ "$version" == 1 || "$version" == 2 ]] || return 3
   REPLY="$(print -rn -- "$metadata" | jq -cer --arg name "$item_name" '
     def safe_string:
       type == "string" and (test("[\u0000-\u001f\u007f]") | not);
     select(type == "object")
     | select((keys - ["description", "lifecycle", "mode", "path", "version"]) | length == 0)
-    | select(.version == 1)
+    | select(.version == 1 or .version == 2)
     | select(.path | safe_string and length > 0)
     | select(.mode | safe_string and test("^0[0-7]{3}$"))
     | select(.lifecycle == "provision" or .lifecycle == "recovery")
@@ -1759,7 +1760,7 @@ _bwfile_metadata_yaml() {
   local configured_path="$1" mode="$2" lifecycle="$3" description="$4"
   jq -cn --arg path "$configured_path" --arg mode "$mode" --arg lifecycle "$lifecycle" \
     --arg description "$description" '
-      {version: 1, path: $path, mode: $mode, lifecycle: $lifecycle}
+      {version: 2, path: $path, mode: $mode, lifecycle: $lifecycle}
       + (if $description == "" then {} else {description: $description} end)
     ' | yq eval -P '.' -
 }
@@ -1841,19 +1842,46 @@ _bwfile_find() {
 }
 
 _bwfile_content_stream() {
-  local session="$1" id="$2"
+  local session="$1" record="$2" id version
+  id="$(print -rn -- "$record" | jq -r '.id')"
+  version="$(print -rn -- "$record" | jq -r '.version')"
   setopt localoptions pipefail
-  BW_SESSION="$session" bw get item "$id" 2>/dev/null | jq -je '
-    [.fields[]? | select(.name == "content" and .type == 1 and (.value | type == "string"))]
-    | if length == 1 then .[0].value else error("missing or ambiguous content field") end
+  BW_SESSION="$session" bw get item "$id" 2>/dev/null \
+    | jq -je --argjson version "$version" --argjson chunk_bytes "$BWFILE_CONTENT_CHUNK_BYTES" '
+    def chunk_name($number):
+      ("0000" + ($number | tostring)) as $padded
+      | "content_" + $padded[($padded | length) - 4:];
+    if $version == 1 then
+      [.fields[]? | select(.name == "content" and .type == 1 and (.value | type == "string"))]
+      | if length == 1 then .[0].value else error("missing or ambiguous content field") end
+    elif $version == 2 then
+      [.fields[]?
+        | select((.name? | type) == "string")
+        | select(.name == "content" or (.name | startswith("content_")))] as $reserved
+      | [$reserved[]
+        | select((.name | test("^content_[0-9]{4}$"))
+                 and .type == 1
+                 and (.value | type == "string")
+                 and (.value | utf8bytelength) <= $chunk_bytes)]
+      | sort_by(.name) as $parts
+      | if ($reserved | length) == ($parts | length)
+          and ($parts | length) > 0
+          and ($parts | length) <= 9999
+          and all(range(0; $parts | length); . as $index | $parts[$index].name == chunk_name($index + 1))
+        then $parts | map(.value) | join("")
+        else error("missing, malformed, oversized, or non-contiguous content chunks")
+        end
+    else
+      error("unsupported bwfile content version")
+    end
   '
 }
 
 _bwfile_content_matches() {
-  local session="$1" id="$2" destination="$3"
+  local session="$1" record="$2" destination="$3"
   local -a stages
   setopt localoptions pipefail
-  _bwfile_content_stream "$session" "$id" | cmp -s -- "$destination" -
+  _bwfile_content_stream "$session" "$record" | cmp -s -- "$destination" -
   stages=(${pipestatus[@]})
   (( stages[1] == 0 )) || return 2
   (( stages[2] == 0 ))
@@ -1913,9 +1941,33 @@ _bwfile_save() {
   if (( count == 1 )); then
     id="$(print -rn -- "$matches" | jq -r '.[0].id')"
     if ! BW_SESSION="$session" bw get item "$id" 2>/dev/null \
-      | jq -c --arg name "$item_name" --arg notes "$metadata" --rawfile content "$payload_source" '
+      | jq -c --arg name "$item_name" --arg notes "$metadata" --rawfile content "$payload_source" \
+          --argjson chunk_bytes "$BWFILE_CONTENT_CHUNK_BYTES" '
+          def content_fields:
+            (if ($content | length) == 0 then [""] else
+              reduce ($content | explode[]) as $codepoint
+                ({parts:[], current:"", bytes:0};
+                 ($codepoint | [.] | implode) as $character
+                 | ($character | utf8bytelength) as $character_bytes
+                 | if .bytes > 0 and (.bytes + $character_bytes) > $chunk_bytes then
+                     .parts += [.current] | .current = $character | .bytes = $character_bytes
+                   else
+                     .current += $character | .bytes += $character_bytes
+                   end)
+              | .parts + [.current]
+            end) as $chunks
+            | if ($chunks | length) > 9999 then error("bwfile payload needs more than 9999 content chunks")
+              else [range(0; $chunks | length) as $index
+                | ($index + 1) as $number
+                | ("0000" + ($number | tostring)) as $padded
+                | {name:("content_" + $padded[($padded | length) - 4:]),
+                   value:$chunks[$index], type:1}]
+            end;
           .name = $name | .type = 2 | .secureNote = {type: 0} | .notes = $notes
-          | .fields = ([.fields[]? | select(.name != "content")] + [{name:"content", value:$content, type:1}])
+          | .fields = ([.fields[]?
+              | select((.name? | type) != "string"
+                       or (.name != "content" and (.name | startswith("content_") | not)))]
+            + content_fields)
           | del(.login, .card, .identity, .sshKey)
         ' | bw encode | BW_SESSION="$session" bw edit item "$id" >/dev/null 2>&1; then
       print -u2 "Unable to update Bitwarden item '$item_name'."
@@ -1923,9 +1975,30 @@ _bwfile_save() {
     fi
   else
     if ! BW_SESSION="$session" bw get template item 2>/dev/null \
-      | jq -c --arg name "$item_name" --arg notes "$metadata" --rawfile content "$payload_source" '
+      | jq -c --arg name "$item_name" --arg notes "$metadata" --rawfile content "$payload_source" \
+          --argjson chunk_bytes "$BWFILE_CONTENT_CHUNK_BYTES" '
+          def content_fields:
+            (if ($content | length) == 0 then [""] else
+              reduce ($content | explode[]) as $codepoint
+                ({parts:[], current:"", bytes:0};
+                 ($codepoint | [.] | implode) as $character
+                 | ($character | utf8bytelength) as $character_bytes
+                 | if .bytes > 0 and (.bytes + $character_bytes) > $chunk_bytes then
+                     .parts += [.current] | .current = $character | .bytes = $character_bytes
+                   else
+                     .current += $character | .bytes += $character_bytes
+                   end)
+              | .parts + [.current]
+            end) as $chunks
+            | if ($chunks | length) > 9999 then error("bwfile payload needs more than 9999 content chunks")
+              else [range(0; $chunks | length) as $index
+                | ($index + 1) as $number
+                | ("0000" + ($number | tostring)) as $padded
+                | {name:("content_" + $padded[($padded | length) - 4:]),
+                   value:$chunks[$index], type:1}]
+            end;
           .name = $name | .type = 2 | .secureNote = {type: 0} | .notes = $notes
-          | .fields = [{name:"content", value:$content, type:1}]
+          | .fields = content_fields
           | del(.login, .card, .identity, .sshKey)
         ' | bw encode | BW_SESSION="$session" bw create item >/dev/null 2>&1; then
       print -u2 "Unable to create Bitwarden item '$item_name'."
@@ -1940,9 +2013,8 @@ _bwfile_save() {
 }
 
 _bwfile_materialize() {
-  local session="$1" record="$2" force="$3" name id configured mode lifecycle destination parent temporary stages existed=0
+  local session="$1" record="$2" force="$3" name configured mode lifecycle destination parent temporary stages existed=0
   name="$(print -rn -- "$record" | jq -r '.name')"
-  id="$(print -rn -- "$record" | jq -r '.id')"
   configured="$(print -rn -- "$record" | jq -r '.path')"
   mode="$(print -rn -- "$record" | jq -r '.mode')"
   lifecycle="$(print -rn -- "$record" | jq -r '.lifecycle')"
@@ -1962,7 +2034,7 @@ _bwfile_materialize() {
 
   if [[ -e "$destination" ]]; then
     existed=1
-    _bwfile_content_matches "$session" "$id" "$destination"
+    _bwfile_content_matches "$session" "$record" "$destination"
     local comparison=$?
     if (( comparison == 0 )); then
       local current_mode
@@ -1989,7 +2061,7 @@ _bwfile_materialize() {
   temporary="$(umask 077; mktemp "$parent/.bwfile.XXXXXXXX")" || { print -u2 "Unable to create a secure temporary file for $name."; return 1; }
   chmod 600 -- "$temporary" 2>/dev/null || { rm -f -- "$temporary"; print -u2 "Unable to secure temporary file for $name."; return 1; }
   setopt localoptions pipefail
-  _bwfile_content_stream "$session" "$id" >| "$temporary"
+  _bwfile_content_stream "$session" "$record" >| "$temporary"
   stages=(${pipestatus[@]})
   if ! _bw_pipefail "${stages[@]}"; then
     rm -f -- "$temporary"
@@ -2070,9 +2142,8 @@ _bwfile_list() {
 }
 
 _bwfile_local_state() {
-  local session="$1" record="$2" name id configured mode destination current_mode
+  local session="$1" record="$2" name configured mode destination current_mode
   name="$(print -rn -- "$record" | jq -r '.name')"
-  id="$(print -rn -- "$record" | jq -r '.id')"
   configured="$(print -rn -- "$record" | jq -r '.path')"
   mode="$(print -rn -- "$record" | jq -r '.mode')"
   _bwfile_resolve_path "$configured" || { REPLY='unsafe path'; return 1; }
@@ -2080,7 +2151,7 @@ _bwfile_local_state() {
   [[ ! -d "$destination" && ! -L "$destination" ]] || { REPLY='unsafe destination'; return 1; }
   [[ -e "$destination" ]] || { REPLY='missing'; return 0; }
   [[ -r "$destination" ]] || { REPLY='inaccessible'; return 1; }
-  _bwfile_content_matches "$session" "$id" "$destination"
+  _bwfile_content_matches "$session" "$record" "$destination"
   case $? in
     0) ;;
     1) REPLY='content differs'; return 0 ;;
@@ -2164,7 +2235,7 @@ _bwfile_help() {
   print -r -- 'Usage: bwfile <command> [arguments]
 
 Commands:
-  save PATH              store a textual local file in a hidden content field
+  save PATH              store a textual local file in bounded hidden content fields
   load NAME              securely restore one managed file
   load --all             restore provision items only
   load --lifecycle TYPE  restore provision or recovery items explicitly
@@ -2176,7 +2247,7 @@ Commands:
 
 Reads never sync automatically. Recovery items are never included by --all.
 Paths must be absolute or begin with ~/. Save follows source symlinks; load refuses symlinks.
-Version 1 supports textual files only and owner read/write with optional group read.'
+Only textual files are supported; modes allow owner read/write with optional group read.'
 }
 
 bwfile() {
